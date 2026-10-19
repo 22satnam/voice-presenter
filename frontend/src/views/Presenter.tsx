@@ -124,7 +124,7 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
           pending = parts.remainder;
           parts.sentences.forEach(enqueue);
         } else if (event.type === "usage") tokenInfo = event.usage;
-        else if (event.type === "fallback") setToast("Provider quota reached · switched to Gemini");
+        else if (event.type === "fallback") setToast(`Primary provider unavailable · switched to ${event.provider}`);
         else if (event.type === "error") throw new Error(event.message);
       }
       if (pending.trim()) enqueue(pending.trim());
