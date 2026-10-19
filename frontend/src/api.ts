@@ -32,7 +32,7 @@ export async function transcribeAudio(audio: Blob, signal: AbortSignal): Promise
   return (await response.json()).text as string;
 }
 
-export async function speechAudio(text: string, signal: AbortSignal): Promise<ArrayBuffer> {
+export async function speechAudio(text: string, signal?: AbortSignal): Promise<ArrayBuffer> {
   const response = await fetch(API + '/api/tts', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text }), signal,
