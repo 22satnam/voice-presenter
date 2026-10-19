@@ -27,7 +27,8 @@ app.add_middleware(
 )
 logger = logging.getLogger('presenter')
 DECK_DIR = Path(__file__).parent / 'decks'
-GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.5-flash-lite')
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.8-flash')
+NARRATION_MODEL = os.getenv('GEMINI_NARRATION_MODEL', 'gemini-3.5-flash-lite')
 GROQ_MODEL = os.getenv('GROQ_ANSWER_MODEL', 'openai/gpt-oss-20b')
 TTS_MODEL = os.getenv('GEMINI_TTS_MODEL', 'gemini-3.8-flash-tts')
 TTS_VOICE = os.getenv('GEMINI_TTS_VOICE', 'Sulafat')
@@ -77,7 +78,7 @@ def parse_json(text):
     return json.loads(match.group())
 
 
-async def generate(prompt: str, *, json_result: bool = False, max_tokens: int = 550):
+async def generate(prompt: str, *, json_result: bool = False, max_tokens: int = 550, preferred_model: str | None = None):
     """Gemini is preferred. Groq is only used if Gemini fails."""
     gemini_key = os.getenv('GEMINI_API_KEY')
     if gemini_key:
@@ -88,7 +89,7 @@ async def generate(prompt: str, *, json_result: bool = False, max_tokens: int = 
         if json_result:
             body['generationConfig']['responseMimeType'] = 'application/json'
         # Try another current Flash model if the configured one isn't available to this key.
-        models = list(dict.fromkeys([GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-3.1-flash-lite']))
+        models = list(dict.fromkeys([preferred_model or GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-3.5-flash-lite']))
         for model in models:
             try:
                 async with httpx.AsyncClient(timeout=35) as client:
@@ -136,7 +137,8 @@ async def generate(prompt: str, *, json_result: bool = False, max_tokens: int = 
 def health():
     return {'ok': True, 'gemini_configured': bool(os.getenv('GEMINI_API_KEY')),
             'groq_configured': bool(os.getenv('GROQ_API_KEY')), 'gemini_model': GEMINI_MODEL,
-            'tts_model': TTS_MODEL, 'stt_configured': bool(os.getenv('GROQ_API_KEY'))}
+            'narration_model': NARRATION_MODEL, 'tts_model': TTS_MODEL,
+            'stt_configured': bool(os.getenv('GROQ_API_KEY'))}
 
 
 @app.get('/api/decks')
@@ -181,7 +183,7 @@ async def narrate(req: NarrateInput):
         'If the slide contains placeholders, say that briefly instead of filling them in.\n\n'
         f'SLIDE TITLE: {slide["title"]}\nSLIDE TEXT: {slide["text"]}\nNOTES: {slide["notes"]}'
     )
-    text, provider = await generate(prompt, max_tokens=600)
+    text, provider = await generate(prompt, max_tokens=600, preferred_model=NARRATION_MODEL)
     return {'text': text.strip(), 'provider': provider, 'slide_index': req.slide_index}
 
 
@@ -205,7 +207,7 @@ async def ask(req: AskInput):
         f'Question: {req.question}\n'
         f'Presentation: {json.dumps(slides, ensure_ascii=False)}'
     )
-    text, provider = await generate(prompt, json_result=True, max_tokens=450)
+    text, provider = await generate(prompt, json_result=True, max_tokens=450, preferred_model=GEMINI_MODEL)
     try:
         result = parse_json(text)
         index = max(0, min(len(deck['slides']) - 1, int(result['slide_number']) - 1))
