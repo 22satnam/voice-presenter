@@ -13,7 +13,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 load_dotenv(Path(__file__).with_name('.env'))
@@ -289,6 +289,122 @@ async def ask(req: AskInput):
     except (KeyError, ValueError, TypeError):
         raise HTTPException(502, 'The model returned an invalid answer')
     return {'slide_index': index, 'slide_number': index+1, 'answer': answer, 'provider': provider}
+
+
+@app.post('/api/ask-stream')
+async def ask_stream(req: AskInput):
+    """Stream slide selection first, then the spoken answer text."""
+    deck = load_deck(req.deck_id)
+    get_slide(deck, req.current_slide)
+    slides = [
+        {'number': i + 1, 'title': slide['title'], 'content': slide['text'][:950]}
+        for i, slide in enumerate(deck['slides'])
+    ]
+    prompt = (
+        'You are answering a live audience question about the presentation below. '
+        'The presentation is authoritative. Your FIRST output line must be exactly '
+        '"SLIDE: N" where N is the single most relevant 1-based slide number. '
+        'After that line, answer naturally in two to five spoken sentences. '
+        'Do not repeat the slide number in the answer. Do not fabricate facts. '
+        'If the deck does not contain the answer, keep the current slide and say so briefly. '
+        'Use recent conversation only to resolve follow-up references.\n\n'
+        f'PRESENTATION: {json.dumps(slides, ensure_ascii=False)}\n\n'
+        f'Current slide: {req.current_slide + 1}\n'
+        f'Recent conversation: {json.dumps([m.model_dump() for m in req.history], ensure_ascii=False)}\n'
+        f'Question: {req.question}'
+    )
+
+    async def events():
+        key = os.getenv('GEMINI_API_KEY')
+        if not key:
+            fallback = await ask(req)
+            yield f'data: {json.dumps({"type": "slide", "slide_index": fallback["slide_index"]})}\n\n'
+            yield f'data: {json.dumps({"type": "text", "text": fallback["answer"]})}\n\n'
+            return
+
+        body = {
+            'model': GEMINI_MODEL,
+            'input': prompt,
+            'stream': True,
+            'generation_config': {'thinking_level': 'low'},
+        }
+        prefix = ''
+        slide_sent = False
+        emitted_text = False
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(45, read=40)) as client:
+                async with client.stream(
+                    'POST',
+                    'https://generativelanguage.googleapis.com/v1beta/interactions',
+                    headers={
+                        'x-goog-api-key': key,
+                        'Content-Type': 'application/json',
+                        'Accept': 'text/event-stream',
+                    },
+                    json=body,
+                ) as response:
+                    if response.status_code >= 400:
+                        await response.aread()
+                        raise httpx.HTTPStatusError(
+                            'Gemini streaming request failed',
+                            request=response.request,
+                            response=response,
+                        )
+
+                    async for line in response.aiter_lines():
+                        if not line.startswith('data: '):
+                            continue
+                        raw = line[6:]
+                        if raw == '[DONE]':
+                            break
+                        try:
+                            payload = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if payload.get('event_type') != 'step.delta':
+                            continue
+                        delta = payload.get('delta') or {}
+                        if delta.get('type') != 'text' or not delta.get('text'):
+                            continue
+
+                        chunk = delta['text']
+                        if not slide_sent:
+                            prefix += chunk
+                            if '\n' not in prefix:
+                                continue
+                            first, remainder = prefix.split('\n', 1)
+                            match = re.fullmatch(r'\s*SLIDE:\s*(\d+)\s*', first, flags=re.I)
+                            if not match:
+                                raise ValueError('Gemini did not return slide number first')
+                            index = max(0, min(len(deck['slides']) - 1, int(match.group(1)) - 1))
+                            yield f'data: {json.dumps({"type": "slide", "slide_index": index})}\n\n'
+                            slide_sent = True
+                            prefix = ''
+                            if remainder:
+                                emitted_text = True
+                                yield f'data: {json.dumps({"type": "text", "text": remainder})}\n\n'
+                        else:
+                            emitted_text = True
+                            yield f'data: {json.dumps({"type": "text", "text": chunk})}\n\n'
+
+            if not slide_sent:
+                raise ValueError('Gemini returned no slide selection')
+            if not emitted_text:
+                raise ValueError('Gemini returned no answer text')
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            logger.warning('Gemini answer stream failed (%s)', type(exc).__name__)
+            if not slide_sent and not emitted_text:
+                try:
+                    fallback = await ask(req)
+                    yield f'data: {json.dumps({"type": "slide", "slide_index": fallback["slide_index"]})}\n\n'
+                    yield f'data: {json.dumps({"type": "text", "text": fallback["answer"]})}\n\n'
+                    return
+                except HTTPException:
+                    pass
+            yield f'data: {json.dumps({"type": "error", "message": "Could not complete the answer"})}\n\n'
+
+    return StreamingResponse(events(), media_type='text/event-stream')
 
 
 @app.post('/api/stt')
