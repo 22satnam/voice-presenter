@@ -39,6 +39,10 @@ class NarrateInput(BaseModel):
     slide_index: int = Field(ge=0)
 
 
+class PrepareDeckInput(BaseModel):
+    deck_id: str
+
+
 class ChatMessage(BaseModel):
     role: Literal['user', 'assistant']
     text: str = Field(min_length=1, max_length=900)
@@ -84,15 +88,18 @@ async def generate(prompt: str, *, json_result: bool = False, max_tokens: int = 
     if gemini_key:
         body = {
             'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
-            'generationConfig': {'temperature': 0.4, 'maxOutputTokens': max_tokens},
+            'generationConfig': {'maxOutputTokens': max_tokens},
         }
         if json_result:
             body['generationConfig']['responseMimeType'] = 'application/json'
         # Try another current Flash model if the configured one isn't available to this key.
         models = list(dict.fromkeys([preferred_model or GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-3.5-flash-lite']))
         for model in models:
+            body['generationConfig']['thinkingConfig'] = {
+                'thinkingLevel': 'low' if model == 'gemini-3.8-flash' else 'minimal'
+            }
             try:
-                async with httpx.AsyncClient(timeout=35) as client:
+                async with httpx.AsyncClient(timeout=45) as client:
                     response = await client.post(
                         f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent',
                         headers={'x-goog-api-key': gemini_key}, json=body,
@@ -138,7 +145,8 @@ def health():
     return {'ok': True, 'gemini_configured': bool(os.getenv('GEMINI_API_KEY')),
             'groq_configured': bool(os.getenv('GROQ_API_KEY')), 'gemini_model': GEMINI_MODEL,
             'narration_model': NARRATION_MODEL, 'tts_model': TTS_MODEL,
-            'stt_configured': bool(os.getenv('GROQ_API_KEY'))}
+            'deepgram_configured': bool(os.getenv('DEEPGRAM_API_KEY')),
+            'stt_configured': bool(os.getenv('DEEPGRAM_API_KEY') or os.getenv('GROQ_API_KEY'))}
 
 
 @app.get('/api/decks')
@@ -153,6 +161,72 @@ def list_decks():
 @app.get('/api/decks/{deck_id}')
 def read_deck(deck_id: str):
     return load_deck(deck_id)
+
+
+@app.post('/api/prepare-deck')
+async def prepare_deck(req: PrepareDeckInput):
+    """Generate the full narration script once before a presentation starts."""
+    deck = load_deck(req.deck_id)
+    slides = [
+        {
+            'number': i + 1,
+            'title': slide['title'],
+            'text': slide['text'],
+            'notes': slide['notes'],
+        }
+        for i, slide in enumerate(deck['slides'])
+    ]
+    prompt = (
+        f'Write the complete spoken narration for the presentation "{deck["title"]}". '
+        'Return ONLY JSON as {"slides":[{"number":1,"text":"..."}]}. '
+        'Create exactly one item for every slide in order. '
+        'Slide 1 should introduce the presentation like a real presenter and explain what '
+        'the audience will learn. Later slides should continue naturally without repeated greetings. '
+        'Do not answer imaginary questions and do not invite questions inside the narration. '
+        'Use about 65-100 spoken words for substantive slides and less for title, agenda, quiz, '
+        'or placeholder slides. Do not invent facts or numbers. '
+        'Keep each slide narration easy to split into normal spoken sentences.\n\n'
+        'PRESENTATION SLIDES:\n'
+        + json.dumps(slides, ensure_ascii=False)
+    )
+    text, provider = await generate(
+        prompt, json_result=True, max_tokens=7000, preferred_model=NARRATION_MODEL
+    )
+    try:
+        result = parse_json(text)
+        items = result['slides']
+        if len(items) != len(deck['slides']):
+            raise ValueError('Wrong slide count')
+        narrations = []
+        for i, item in enumerate(items):
+            if int(item['number']) != i + 1 or not str(item['text']).strip():
+                raise ValueError('Invalid slide narration')
+            narrations.append({'slide_index': i, 'text': str(item['text']).strip()})
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(502, 'The narration model returned an invalid deck script')
+    return {'deck_id': deck['id'], 'provider': provider, 'slides': narrations}
+
+
+@app.post('/api/deepgram-token')
+async def deepgram_token():
+    """Mint a short-lived browser token; never expose the long-lived Deepgram key."""
+    key = os.getenv('DEEPGRAM_API_KEY')
+    if not key:
+        raise HTTPException(503, 'Deepgram Flux is not configured')
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                'https://api.deepgram.com/v1/auth/grant',
+                headers={'Authorization': f'Token {key}'},
+                json={'ttl_seconds': 300},
+            )
+            response.raise_for_status()
+        token = response.json()
+        return {'access_token': token['access_token'], 'expires_in': token.get('expires_in', 300)}
+    except (httpx.HTTPError, KeyError, ValueError) as exc:
+        code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+        logger.warning('Deepgram token mint failed (%s)', code)
+        raise HTTPException(502, 'Could not start Deepgram Flux') from exc
 
 
 @app.post('/api/narrate')
@@ -194,18 +268,16 @@ async def ask(req: AskInput):
     slides = [{'number': i+1, 'title': s['title'], 'content': s['text'][:950]}
               for i, s in enumerate(deck['slides'])]
     prompt = (
-        'You are answering a question during a presentation. Find the slide most relevant '
-        'to the question, then answer naturally using that slide and other relevant content. '
+        'You are answering a question during a presentation. The presentation below is the '
+        'authoritative source. Find the slide most relevant to the question, then answer naturally. '
         'Return ONLY a JSON object with "slide_number" (1-based integer) and "answer" '
-        '(two to five spoken sentences). Do not fabricate facts, and make it clear when '
-        'the uploaded presentation does not contain an answer. For questions unrelated '
-        'to the slides, keep the current slide and give a brief general answer only if confident. '
-        'For follow-up questions, interpret references like "that", "it", or "the last point" '
-        'using the recent conversation, but choose the slide based on the actual deck.\n'
+        '(two to five spoken sentences). Do not fabricate facts. If the presentation does not '
+        'contain the answer, say so. For a follow-up, use the recent conversation to resolve '
+        'references such as "that", "it", or "the last point".\n\n'
+        f'PRESENTATION: {json.dumps(slides, ensure_ascii=False)}\n\n'
         f'Current slide: {req.current_slide + 1}\n'
         f'Recent conversation: {json.dumps([m.model_dump() for m in req.history], ensure_ascii=False)}\n'
-        f'Question: {req.question}\n'
-        f'Presentation: {json.dumps(slides, ensure_ascii=False)}'
+        f'Question: {req.question}'
     )
     text, provider = await generate(prompt, json_result=True, max_tokens=450, preferred_model=GEMINI_MODEL)
     try:
