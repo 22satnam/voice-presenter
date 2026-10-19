@@ -157,14 +157,28 @@ def read_deck(deck_id: str):
 async def narrate(req: NarrateInput):
     deck = load_deck(req.deck_id)
     slide = get_slide(deck, req.slide_index)
+    if req.slide_index == 0:
+        instruction = (
+            'This is the opening slide. Start like a real presenter: introduce the topic, '
+            'briefly explain what the audience will learn from this presentation, and then '
+            'transition into the slide. Do not answer an imaginary question, do not say '
+            '"you are welcome", and do not invite questions yet. '
+        )
+    else:
+        instruction = (
+            'Explain the slide as the next part of an ongoing presentation and connect it '
+            'naturally to the topic. Do not greet the audience again and do not invite questions; '
+            'the application handles question pauses separately. '
+        )
     prompt = (
         f'You are giving a live presentation called "{deck["title"]}". '
+        + instruction +
         f'Explain slide {req.slide_index + 1} in clear, natural spoken English. '
-        'Discuss the actual points on the slide and what they mean. '
+        'Discuss only the actual points on the slide and what they mean. '
         'Use a conversational flow, not bullets or a formal essay. '
-        'Use around 90 words if the slide has enough substance; use fewer words for title, '
-        'agenda, or template slides. Do not make up numbers or missing facts. '
-        'If this slide contains placeholders, acknowledge that it is an unfinished template.\n\n'
+        'Aim for roughly 70 to 110 words when the slide has enough substance; use less for '
+        'title, agenda, quiz, or template slides. Never invent numbers or missing facts. '
+        'If the slide contains placeholders, say that briefly instead of filling them in.\n\n'
         f'SLIDE TITLE: {slide["title"]}\nSLIDE TEXT: {slide["text"]}\nNOTES: {slide["notes"]}'
     )
     text, provider = await generate(prompt, max_tokens=600)
@@ -235,38 +249,59 @@ async def transcribe(file: UploadFile = File(...)):
 
 @app.post('/api/tts')
 async def tts(req: SpeechInput):
-    """Gemini handles voice generation; lite is the only automatic fallback."""
+    """Generate a complete WAV using Gemini 3.8 TTS."""
     key = os.getenv('GEMINI_API_KEY')
     if not key:
         raise HTTPException(503, 'Gemini voice is not configured')
+
     models = list(dict.fromkeys([TTS_MODEL, 'gemini-3.8-flash-lite-tts']))
-    body = {
-        'contents': [{'role': 'user', 'parts': [{
-            'text': req.text,
-            'speech_metadata': {'style': 'warm, conversational, measured and engaging'},
-        }]}],
-        'generationConfig': {
-            'responseModalities': ['AUDIO'],
-            'speechConfig': {'voiceConfig': {'voice': TTS_VOICE}},
-        },
-    }
     for model in models:
+        body = {
+            'model': model,
+            'input': [{
+                'type': 'user_input',
+                'content': [{
+                    'type': 'text',
+                    'text': req.text,
+                    'annotations': [{
+                        'type': 'speech_metadata',
+                        'style': 'natural business presenter; warm, confident, conversational, steady pace',
+                    }],
+                }],
+            }],
+            'response_format': {'type': 'audio'},
+            'generation_config': {'speech_config': [{'voice': TTS_VOICE}]},
+        }
         try:
             async with httpx.AsyncClient(timeout=50) as client:
                 response = await client.post(
-                    f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent',
+                    'https://generativelanguage.googleapis.com/v1beta/interactions',
                     headers={'x-goog-api-key': key},
                     json=body,
                 )
                 response.raise_for_status()
-            parts = response.json()['candidates'][0]['content']['parts']
-            encoded = next(part['inlineData']['data'] for part in parts if 'inlineData' in part)
+
+            output = response.json()
+            encoded = None
+            for step in output.get('steps', []):
+                if step.get('type') != 'model_output':
+                    continue
+                for item in step.get('content', []):
+                    if item.get('type') == 'audio' and item.get('data'):
+                        encoded = item['data']
+            if not encoded:
+                raise ValueError('Gemini returned no audio')
+
             audio = base64.b64decode(encoded)
             if audio[:4] != b'RIFF':
                 raise ValueError('Gemini did not return WAV audio')
-            return Response(content=audio, media_type='audio/wav',
-                            headers={'X-Voice-Provider': model, 'Cache-Control': 'no-store'})
-        except (httpx.HTTPError, ValueError, KeyError, IndexError, StopIteration) as exc:
+            return Response(
+                content=audio,
+                media_type='audio/wav',
+                headers={'X-Voice-Provider': model, 'Cache-Control': 'no-store'},
+            )
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
             code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
             logger.warning('Gemini voice model %s unavailable (%s)', model, code)
+
     raise HTTPException(502, 'Gemini voice unavailable. Please retry shortly')
