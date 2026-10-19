@@ -11,6 +11,7 @@ import {
   CACHE_VERSION,
   readPreparedDeck,
   savePreparedDeck,
+  sentenceBoundary,
   splitSentences,
   type CachedDeck,
   type CachedSlide,
@@ -63,13 +64,13 @@ function looksLikeEcho(question: string, spokenText: string) {
   const questionText = cleanSpeech(question);
   const sourceText = cleanSpeech(spokenText);
   if (!questionText || !sourceText) return false;
-  if (questionText.length >= 14 && sourceText.includes(questionText)) return true;
+  if (questionText.length >= 25 && sourceText.includes(questionText)) return true;
 
   const words = [...new Set(questionText.split(' ').filter(word => word.length > 2))];
-  if (words.length < 3) return false;
+  if (words.length < 5) return false;
   const sourceWords = new Set(sourceText.split(' '));
   const overlap = words.filter(word => sourceWords.has(word)).length;
-  return overlap / words.length >= 0.72;
+  return overlap / words.length >= 0.9;
 }
 
 function completeSentences(buffer: string) {
@@ -238,7 +239,7 @@ export default function App() {
       } catch (error) {
         if (signal.aborted) throw error;
         lastError = error;
-        await new Promise(resolve => window.setTimeout(resolve, 650 * (attempt + 1)));
+        await new Promise(resolve => window.setTimeout(resolve, 1200 * (attempt + 1)));
       }
     }
     throw lastError instanceof Error ? lastError : new Error('Voice generation failed');
@@ -265,64 +266,41 @@ export default function App() {
     );
     if (signal.aborted) return;
 
-    const slideSentences = narration.slides.map(item => splitSentences(item.text));
-    const jobs: {
-      slideIndex: number;
-      sentenceIndex: number;
-      text: string;
-      run: () => Promise<ArrayBuffer>;
-    }[] = [];
-
-    slideSentences.forEach((sentences, slideIndex) => {
-      sentences.forEach((text, sentenceIndex) => {
-        jobs.push({
-          slideIndex,
-          sentenceIndex,
-          text,
-          run: () => audioWithRetry(text, signal),
-        });
-      });
-    });
-
     const fillerEntries = Object.entries(FILLERS) as [keyof CachedDeck['fillers'], string][];
-    const total = jobs.length + fillerEntries.length;
+    const total = narration.slides.length + fillerEntries.length;
     let done = 0;
     setPrepProgress({ done, total });
-    setLoadingText('Generating natural voice for the presentation…');
+    setLoadingText('Generating natural voice slide by slide…');
 
-    const audio = await runPool(
-      jobs.map(job => job.run),
-      4,
-      () => {
-        done += 1;
-        setPrepProgress({ done, total });
-      },
-    );
+    const pacedAudio = async (text: string) => {
+      const audio = await audioWithRetry(text, signal);
+      done += 1;
+      setPrepProgress({ done, total });
+      // Keep preparation below bursty speech-model limits.
+      await new Promise(resolve => window.setTimeout(resolve, 450));
+      return audio;
+    };
 
-    const fillerAudio = await runPool(
-      fillerEntries.map(([, text]) => () => audioWithRetry(text, signal)),
-      3,
-      () => {
-        done += 1;
-        setPrepProgress({ done, total });
-      },
-    );
+    // One Gemini TTS call per slide, sequentially. This is deliberately not parallel.
+    const slideAudio: ArrayBuffer[] = [];
+    for (const item of narration.slides) {
+      if (signal.aborted) return;
+      slideAudio.push(await pacedAudio(item.text));
+    }
+
+    const fillers = {} as CachedDeck['fillers'];
+    for (const [key, text] of fillerEntries) {
+      if (signal.aborted) return;
+      fillers[key] = await pacedAudio(text);
+    }
 
     if (signal.aborted) return;
 
     const slides: CachedSlide[] = narration.slides.map((item, slideIndex) => ({
       text: item.text,
-      sentences: slideSentences[slideIndex].map((text, sentenceIndex) => {
-        const jobIndex = jobs.findIndex(
-          job => job.slideIndex === slideIndex && job.sentenceIndex === sentenceIndex,
-        );
-        return { text, audio: audio[jobIndex] };
-      }),
+      sentences: splitSentences(item.text),
+      audio: slideAudio[slideIndex],
     }));
-
-    const fillers = Object.fromEntries(
-      fillerEntries.map(([key], index) => [key, fillerAudio[index]]),
-    ) as CachedDeck['fillers'];
 
     const prepared: CachedDeck = {
       cacheVersion: CACHE_VERSION,
@@ -375,14 +353,14 @@ export default function App() {
     setSlide(next);
   }
 
-  async function decodedSentence(slideIndex: number, sentenceIndex: number) {
-    const key = slideIndex + ':' + sentenceIndex;
+  async function decodedSlide(slideIndex: number) {
+    const key = 'slide:' + slideIndex;
     const cached = decoded.current.get(key);
     if (cached) return cached;
 
-    const sentence = preparedDeck.current?.slides[slideIndex]?.sentences[sentenceIndex];
-    if (!sentence) throw new Error('Prepared narration is missing');
-    const buffer = await speaker.current.decode(sentence.audio);
+    const prepared = preparedDeck.current?.slides[slideIndex];
+    if (!prepared) throw new Error('Prepared narration is missing');
+    const buffer = await speaker.current.decode(prepared.audio);
     decoded.current.set(key, buffer);
     return buffer;
   }
@@ -425,14 +403,18 @@ export default function App() {
     let fullText = '';
     let pending = '';
     const sentences: PreparedAnswer['sentences'] = [];
+    let ttsChain: Promise<void> = Promise.resolve();
 
     const queueSentence = (sentence: string) => {
       const clean = sentence.trim();
       if (!clean) return;
-      sentences.push({
-        text: clean,
-        audio: audioWithRetry(clean, controller.signal).catch(() => null),
-      });
+
+      const audio = ttsChain
+        .then(() => audioWithRetry(clean, controller.signal))
+        .catch(() => null);
+
+      ttsChain = audio.then(() => undefined, () => undefined);
+      sentences.push({ text: clean, audio });
     };
 
     await streamAnswer(
@@ -659,23 +641,24 @@ export default function App() {
           narration: true,
         });
 
-        for (let sentenceIndex = 0; sentenceIndex < preparedSlide.sentences.length;) {
-          if (controller.signal.aborted) break;
+        const buffer = await decodedSlide(slideIndex);
+        let offset = 0;
 
-          const sentence = preparedSlide.sentences[sentenceIndex];
-          currentSentence.current = { slideIndex, text: sentence.text };
-          const buffer = await decodedSentence(slideIndex, sentenceIndex);
-          const result = await speaker.current.play(buffer, controller.signal, setVoice);
+        while (!controller.signal.aborted && offset < buffer.duration - 0.03) {
+          currentSentence.current = { slideIndex, text: preparedSlide.text };
+          const result = await speaker.current.play(buffer, controller.signal, setVoice, offset);
 
-          if (result === 'done') {
+          if (result.status === 'done') {
             currentSentence.current = null;
-            sentenceIndex += 1;
-          } else {
-            const waiter = interrupt.current;
-            if (waiter) await waiter.promise;
-            currentSentence.current = null;
-            // Restart the interrupted sentence from its beginning.
+            break;
           }
+
+          // Approximate the previous sentence boundary from narration text and audio duration.
+          // This avoids hundreds of TTS calls while still restarting at a natural point.
+          offset = sentenceBoundary(preparedSlide.sentences, buffer.duration, result.offset);
+          const waiter = interrupt.current;
+          if (waiter) await waiter.promise;
+          currentSentence.current = null;
         }
 
         if (controller.signal.aborted) break;
