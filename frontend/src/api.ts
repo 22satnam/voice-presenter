@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 const API = (import.meta.env.VITE_API_BASE || 'http://localhost:8000').replace(/\/$/, '');
 
 export type Slide = { title: string; text: string; notes: string; image: string };
