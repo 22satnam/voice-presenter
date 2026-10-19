@@ -1,4 +1,4 @@
-"""Groq primary / Gemini fallback. Provider errors never become fabricated answers."""
+"""Gemini primary / Groq fallback. Provider errors never become fabricated answers."""
 import json
 import os
 from typing import AsyncIterator
@@ -21,6 +21,7 @@ def _headers() -> dict[str, str]:
 def _gemini_contents(messages):
     chunks = []
     for m in messages:
+        # Gemini accepts user/model turns; system instructions must not use a user turn with a model role.
         role = 'model' if m['role'] == 'assistant' else 'user'
         chunks.append({'role': role, 'parts': [{'text': m['content']}]})
     return chunks
@@ -78,7 +79,7 @@ async def complete(messages, model=ROUTER_MODEL, max_tokens=160) -> tuple[str, d
         ) from exc
 
 
-async def stream(messages, model=ANSWER_MODEL, max_tokens=150) -> AsyncIterator[dict]:
+async def stream(messages, model=ANSWER_MODEL, max_tokens=420) -> AsyncIterator[dict]:
     """Try Gemini first; if it fails, stream from Groq as fallback."""
     try:
         value, usage = await gemini_complete(messages, max_tokens)
