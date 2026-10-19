@@ -50,7 +50,7 @@ export class Speaker {
       this.objectUrl = URL.createObjectURL(blob);
       const audio = new Audio(this.objectUrl);
       this.audio = audio;
-      return await new Promise<boolean>((resolve) => {
+      const played = await new Promise<boolean>((resolve) => {
         let finished = false;
         const finish = (heard: boolean) => {
           if (finished) return;
@@ -65,6 +65,8 @@ export class Speaker {
         audio.onerror = () => finish(false);
         void audio.play().catch(() => finish(false));
       });
+      if (played || signal.aborted) return played;
+      return this.browserSpeak(sentence, signal);
     } catch (error) {
       if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return false;
       // Guaranteed-free browser fallback; actual voice availability varies by platform.
