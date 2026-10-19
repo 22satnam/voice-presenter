@@ -168,6 +168,8 @@ export default function App() {
     });
 
     live.current = session;
+    // Do this inside the Present click so Chrome/Safari allow later streamed audio.
+    session.unlockAudio();
 
     try {
       await session.connect();
