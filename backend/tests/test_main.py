@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -91,4 +92,7 @@ async def test_gemini_voice_returns_wav(monkeypatch):
     result = await main.tts(main.SpeechInput(text='Let us look at the next slide.'))
     assert result.status_code == 200
     assert result.body == wav
-    assert b'gemini-3.8-flash-tts' in str(requests[0].url).encode()
+    payload = json.loads(requests[0].content.decode())
+    assert str(requests[0].url).endswith('/v1beta/interactions')
+    assert payload['model'] == 'gemini-3.8-flash-tts'
+    assert payload['generation_config']['speech_config'][0]['voice'] == main.TTS_VOICE
