@@ -180,7 +180,7 @@ async def stream_answer(req: AgentRequest, narration: bool = False):
             await record(req.session_id, 'llm', api_route, provider=usage.get('provider'), model=usage.get('model'),
                          latency_ms=first, input_tokens=usage.get('input_tokens'), output_tokens=usage.get('output_tokens'), payload={'source': kind})
         if piece['type'] == 'fallback':
-            await record(req.session_id, 'fallback', api_route, provider='gemini')
+            await record(req.session_id, 'fallback', api_route, provider=piece.get('provider', 'groq'))
         if piece['type'] == 'error':
             await record(req.session_id, 'error', api_route, status=503)
         yield _sse(piece)
