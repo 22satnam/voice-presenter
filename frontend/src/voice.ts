@@ -1,23 +1,22 @@
 import { speechAudio } from './api';
 
-export type PlayResult = { completed: boolean; offset: number };
-
-type ActivePlayback = {
+type Playback = {
   source: AudioBufferSourceNode;
-  signal: AbortSignal;
-  startedAt: number;
-  offset: number;
-  paused: boolean;
-  pausedAt: number;
+  interrupted: boolean;
   cancelled: boolean;
 };
 
 export class Speaker {
   private context: AudioContext | null = null;
-  private active: ActivePlayback | null = null;
+  private gain: GainNode | null = null;
+  private active: Playback | null = null;
 
   unlock() {
-    this.context ||= new AudioContext();
+    if (!this.context) {
+      this.context = new AudioContext();
+      this.gain = this.context.createGain();
+      this.gain.connect(this.context.destination);
+    }
     void this.context.resume();
   }
 
@@ -31,80 +30,77 @@ export class Speaker {
     return this.decode(audio);
   }
 
-  pause() {
-    const state = this.active;
-    const context = this.context;
-    if (!state || !context) return 0;
+  duck() {
+    if (!this.context || !this.gain) return;
+    const now = this.context.currentTime;
+    this.gain.gain.cancelScheduledValues(now);
+    this.gain.gain.setValueAtTime(this.gain.gain.value, now);
+    this.gain.gain.linearRampToValueAtTime(0.12, now + 0.05);
+  }
 
-    const elapsed = Math.max(0, context.currentTime - state.startedAt);
-    state.pausedAt = Math.min(state.source.buffer?.duration || Infinity, state.offset + elapsed);
-    state.paused = true;
-    try { state.source.stop(); } catch { /* Source already ended. */ }
-    return state.pausedAt;
+  restore() {
+    if (!this.context || !this.gain) return;
+    const now = this.context.currentTime;
+    this.gain.gain.cancelScheduledValues(now);
+    this.gain.gain.setValueAtTime(this.gain.gain.value, now);
+    this.gain.gain.linearRampToValueAtTime(1, now + 0.08);
+  }
+
+  interrupt() {
+    const state = this.active;
+    if (!state) return false;
+    state.interrupted = true;
+    try { state.source.stop(); } catch { /* already ended */ }
+    return true;
   }
 
   stop() {
-    if (!this.active) return;
-    this.active.cancelled = true;
-    try { this.active.source.stop(); } catch { /* Source already ended. */ }
+    const state = this.active;
+    if (!state) return;
+    state.cancelled = true;
+    try { state.source.stop(); } catch { /* already ended */ }
   }
 
   async play(
     buffer: AudioBuffer,
     signal: AbortSignal,
-    offset = 0,
     onVoiceChange?: (voice: string) => void,
-  ): Promise<PlayResult> {
+  ): Promise<'done' | 'interrupted'> {
     if (signal.aborted) throw new DOMException('Stopped', 'AbortError');
 
     this.unlock();
+    this.restore();
     const context = this.context!;
     await context.resume();
-    const safeOffset = Math.max(0, Math.min(offset, Math.max(0, buffer.duration - 0.01)));
     onVoiceChange?.('Gemini voice');
 
-    return new Promise<PlayResult>((resolve, reject) => {
+    return new Promise<'done' | 'interrupted'>((resolve, reject) => {
       const source = context.createBufferSource();
       source.buffer = buffer;
-      source.connect(context.destination);
+      source.connect(this.gain!);
 
-      const state: ActivePlayback = {
-        source,
-        signal,
-        startedAt: context.currentTime,
-        offset: safeOffset,
-        paused: false,
-        pausedAt: safeOffset,
-        cancelled: false,
-      };
+      const state: Playback = { source, interrupted: false, cancelled: false };
       this.active = state;
 
-      const cancel = () => {
+      const abort = () => {
         state.cancelled = true;
-        try { source.stop(); } catch { /* Source already ended. */ }
+        try { source.stop(); } catch { /* already ended */ }
       };
 
-      const finish = () => {
-        signal.removeEventListener('abort', cancel);
+      source.onended = () => {
+        signal.removeEventListener('abort', abort);
         if (this.active === state) this.active = null;
+        this.restore();
 
         if (signal.aborted || state.cancelled) {
           reject(new DOMException('Stopped', 'AbortError'));
-        } else if (state.paused) {
-          resolve({ completed: false, offset: state.pausedAt });
         } else {
-          resolve({ completed: true, offset: buffer.duration });
+          resolve(state.interrupted ? 'interrupted' : 'done');
         }
       };
 
-      signal.addEventListener('abort', cancel, { once: true });
-      source.onended = finish;
-      source.start(0, safeOffset);
+      signal.addEventListener('abort', abort, { once: true });
+      source.start();
     });
-  }
-
-  async speak(text: string, signal: AbortSignal, onVoiceChange?: (voice: string) => void) {
-    const buffer = await this.prepare(text, signal);
-    return this.play(buffer, signal, 0, onVoiceChange);
   }
 }
