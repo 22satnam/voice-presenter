@@ -240,7 +240,14 @@ async def transcribe(file: UploadFile = File(...)):
                 files={'file': (filename, audio, file.content_type or 'audio/webm')},
             )
             response.raise_for_status()
-        return {'text': response.json().get('text', '').strip()}
+        text = response.json().get('text', '').strip()
+        normalized = re.sub(r'[^a-z0-9\\s]', '', text.lower()).strip()
+        if normalized in {
+            'thank you', 'thanks', 'thank you very much', 'thanks a lot',
+            'okay', 'ok', 'alright', 'yes', 'no', 'great', 'cool', 'got it',
+        }:
+            text = ''
+        return {'text': text}
     except (httpx.HTTPError, ValueError) as exc:
         code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
         logger.warning('Transcription failed (%s)', code)
