@@ -6,7 +6,7 @@ import httpx
 
 GROQ_URL = 'https://api.groq.com/openai/v1'
 GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models'
-ROUTER_MODEL = os.getenv('GROQ_ROUTER_MODEL', 'llama-3.1-8b-instant')
+ROUTER_MODEL = os.getenv('GROQ_ROUTER_MODEL', 'openai/gpt-oss-20b')
 ANSWER_MODEL = os.getenv('GROQ_ANSWER_MODEL', 'openai/gpt-oss-20b')
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash-lite')
 
