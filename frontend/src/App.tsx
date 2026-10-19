@@ -57,9 +57,9 @@ export default function App() {
     active.current?.abort();
     active.current = null;
     speaker.current.stop();
+    listener.current.close();
     setRunning(false);
     setBusy(false);
-    setMicStatus(listener.current ? 'Ready' : 'Mic off');
   }
 
   async function openDeck(id: string) {
