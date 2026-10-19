@@ -79,6 +79,11 @@ export class GeminiLivePresenter {
     private callbacks: LiveCallbacks,
   ) {}
 
+  unlockAudio() {
+    if (!this.outputContext) this.outputContext = new AudioContext();
+    void this.outputContext.resume();
+  }
+
   async connect() {
     this.callbacks.onStatus("Connecting to Gemini Live…");
     const { token, model } = await createLiveToken();
@@ -178,9 +183,7 @@ export class GeminiLivePresenter {
 
   sendQuestion(text: string) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    this.socket.send(JSON.stringify({
-      realtimeInput: { text },
-    }));
+    this.sendClientText("Audience question: " + text);
   }
 
   close() {
@@ -326,7 +329,11 @@ export class GeminiLivePresenter {
 
     if (content.modelTurn?.parts) {
       for (const part of content.modelTurn.parts) {
-        if (part.inlineData?.data) this.playPcm(part.inlineData.data);
+        if (part.inlineData?.data) {
+          const mime = String(part.inlineData.mimeType || "");
+          const rate = Number(mime.match(/rate=(\d+)/i)?.[1] || 24000);
+          this.playPcm(part.inlineData.data, rate);
+        }
       }
     }
 
@@ -370,7 +377,7 @@ export class GeminiLivePresenter {
     }));
   }
 
-  private playPcm(base64: string) {
+  private playPcm(base64: string, sampleRate = 24000) {
     const bytes = base64ToBytes(base64);
     const samples = new Int16Array(
       bytes.buffer,
@@ -382,7 +389,7 @@ export class GeminiLivePresenter {
     const context = this.outputContext;
     void context.resume();
 
-    const buffer = context.createBuffer(1, samples.length, 24000);
+    const buffer = context.createBuffer(1, samples.length, sampleRate);
     const channel = buffer.getChannelData(0);
     for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
 
