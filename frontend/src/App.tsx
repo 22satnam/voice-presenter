@@ -39,6 +39,7 @@ export default function App() {
 
   async function openDeck(id: string) {
     stop();
+    speaker.current.unlock();
     startListening();
     setError('');
     setBusy(true);
