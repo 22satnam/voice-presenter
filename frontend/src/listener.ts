@@ -35,6 +35,7 @@ export class Listener {
     }
     this.stream = stream;
     this.context = new AudioContext();
+    void this.context.resume().catch(() => this.onError('Microphone audio is paused by the browser. Try turning the mic on again.'));
     const source = this.context.createMediaStreamSource(stream);
     this.analyser = this.context.createAnalyser();
     this.analyser.fftSize = 1024;
