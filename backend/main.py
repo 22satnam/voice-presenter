@@ -7,6 +7,7 @@ import logging
 import os
 import re
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from dotenv import load_dotenv
@@ -38,7 +39,15 @@ class NarrateInput(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    role: str = Field(pattern='^(user|assistant)
+    role: Literal['user', 'assistant']
+    text: str = Field(min_length=1, max_length=900)
+
+
+class AskInput(BaseModel):
+    deck_id: str
+    question: str = Field(min_length=1, max_length=1500)
+    current_slide: int = Field(ge=0)
+    history: list[ChatMessage] = Field(default_factory=list, max_length=6)
 
 
 class SpeechInput(BaseModel):
