@@ -1,163 +1,209 @@
 # Voice Presenter architecture
 
-The project is intentionally a small voice pipeline rather than a general agent framework.
+## Goal
 
-## Session setup
+Use one persistent Gemini Live session for the full voice interaction:
 
-When a deck is opened for the first time on a browser:
+    presentation narration
+    microphone input
+    barge-in
+    questions
+    slide selection
+    spoken answers
+    conversation continuity
 
-1. The backend generates the complete narration script for all slides in one Gemini Flash-Lite call.
-2. The browser splits each slide narration into normal spoken sentences.
-3. Gemini 3.8 Flash TTS generates audio for every sentence plus four short presenter fillers.
-4. The browser stores the text and WAV data in IndexedDB.
+The application does not chain separate STT, LLM, and TTS services.
 
-The next time that deck is opened on the same browser, the prepared assets are read locally instead of regenerating narration or voice.
+## Session start
 
-A preparation overlay shows progress while the first cache is being built, so the user never sees an unexplained silent screen.
+1. Browser requests POST /api/live-token.
+2. FastAPI uses the server-side Gemini API key to mint a one-use ephemeral token.
+3. Browser connects directly to the Gemini Live v1beta constrained WebSocket endpoint.
+4. Session setup uses gemini-3.8-live with audio output, Kore voice, input/output transcription, server-side automatic activity detection, START_OF_ACTIVITY_INTERRUPTS, and a show_slide function.
+5. The full deck is included in the session system instruction.
+6. The browser opens the microphone and sends raw 16-bit mono PCM audio at 16 kHz.
 
-## Presentation playback
+The backend does not proxy realtime audio.
 
-Presentation playback is local once a deck is prepared:
+## Slide presentation
 
-- Slide narration is sentence-level audio.
-- Slides advance in order.
-- Stop immediately cancels playback and microphone processing.
-- After every two slides, the presenter gives a short cached Q&A prompt.
-- Because narration is sentence-level, an interrupted sentence can simply restart after Q&A instead of seeking to an arbitrary audio timestamp.
+React owns the deterministic slide sequence.
 
-This is why normal slide-to-slide playback does not need an LLM or TTS request during the session.
+For slide N, React sends a client instruction equivalent to:
+
+    Present slide N. Call show_slide(N) first, explain it naturally, then stop speaking.
+
+Gemini calls show_slide. The browser displays the requested slide and sends a tool response. Gemini then presents that slide.
+
+When a narration turn completes normally, React advances to the next slide.
+
+This keeps sequencing deterministic while Gemini owns the natural speech.
 
 ## Barge-in
 
-The browser requests the microphone with acoustic echo cancellation and noise suppression.
+Gemini Live performs server-side VAD.
 
-Silero VAD v6 runs locally in the browser:
+Current setup:
 
-- speech start → immediately duck presenter volume
-- ~300 ms of confirmed speech → stop the current narration sentence
-- false start / misfire → restore presenter volume
+    start sensitivity: LOW
+    end sensitivity: LOW
+    prefix padding: 120 ms
+    silence duration: 350 ms
+    activity handling: START_OF_ACTIVITY_INTERRUPTS
 
-The VAD model runs locally. It does not send silence to a cloud API.
+When the user starts speaking during model audio:
 
-### Deepgram Flux
+1. Gemini cancels the current response.
+2. Gemini sends serverContent.interrupted = true.
+3. The browser immediately stops all queued model audio.
+4. Gemini keeps listening to the same microphone stream.
+5. Gemini responds to the user in the same stateful session.
 
-When `DEEPGRAM_API_KEY` is configured, the backend mints a short-lived Deepgram token. The long-lived key never reaches the browser.
+No custom browser VAD is required.
 
-The browser connects directly to:
+## Question routing
 
-`wss://api.deepgram.com/v2/listen?model=flux-general-en`
+The full slide set is already part of the Live session context.
 
-with:
+The system instruction tells Gemini:
+- use the deck as the main source
+- call show_slide before answering from another slide
+- answer directly
+- do not fabricate missing facts
 
-- `eager_eot_threshold=0.6`
-- `eot_threshold=0.8`
-- `eot_timeout_ms=3500`
+There is no separate slide-router model call.
 
-MediaRecorder produces ~80 ms WebM/Opus chunks. Chunks are buffered locally and are sent to Flux only after Silero sees speech. A small pre-speech ring buffer is flushed first so the beginning of the utterance is not lost.
+## Resume after interruption
 
-Flux events drive turn-taking:
+React remembers which presentation slide was active when interruption occurred.
 
-- `StartOfTurn` → speech is active
-- `EagerEndOfTurn` → begin a speculative Gemini answer
-- `TurnResumed` → cancel the speculative answer
-- `EndOfTurn` → commit the question and answer
+After the audience answer turn completes, React sends an instruction to resume that presentation slide. Gemini already has the conversation in session context, so no manual six-message history window is needed.
 
-If Deepgram is not configured or cannot connect, the same Silero path falls back to a short recorded utterance sent to the existing batch STT endpoint. This keeps the demo usable, but it is not the low-latency Flux path.
+## Audio input
 
-## Dynamic question answering
+Browser pipeline:
 
-Questions use Gemini 3.8 Flash with low thinking.
+    getUserMedia
+    echo cancellation + noise suppression
+    Float32 microphone frames
+    downsample to 16 kHz
+    convert to Int16 PCM
+    base64
+    realtimeInput.audio
 
-The request contains:
+The ScriptProcessor callback currently produces roughly 40 ms chunks on a typical 48 kHz browser audio context.
 
-- compact content for every slide
-- current slide
-- last six Q&A messages
-- the current question
+## Audio output
 
-The large, stable deck prefix is placed first so Gemini's automatic implicit context caching has the best chance of a hit. There is no vector database because the three decks are small enough to fit comfortably in the prompt.
+Gemini Live sends raw 16-bit mono PCM at 24 kHz.
 
-The response is streamed and must begin with:
+Browser pipeline:
 
-`SLIDE: N`
+    base64
+    Int16 samples
+    AudioBuffer at 24 kHz
+    queued AudioBufferSourceNode playback
 
-As soon as that line arrives, the application knows which slide is relevant. The remaining answer text is streamed. Complete sentences are sent to Gemini TTS immediately, so sentence 2 can be generating while sentence 1 is playing.
+When an interruption arrives, the playback queue is emptied immediately.
 
-For an eager Flux turn, the answer can start preparing before final end-of-turn. If Flux sends `TurnResumed`, that work is cancelled.
+## Function calling
 
-## Filler audio
+Gemini has one application tool:
 
-A few short fillers are pre-generated with the deck:
+    show_slide(slide_number)
 
-- “Good question — let me pull that up.”
-- “Sure — let me show you the relevant slide.”
-- Q&A checkpoint prompt
-- final Q&A prompt
+The browser clamps the requested 1-based slide number to the current deck, changes the UI, and returns a successful function response.
 
-A filler can play immediately after the user's turn is confirmed while the real answer is finishing. Fillers are deliberately limited so the presenter does not sound repetitive.
+The tool is declared as blocking so Gemini can switch the visual slide before speaking about it.
 
-## Conversation continuity
+## Conversation transcript
 
-Only the last six Q&A messages are included with a new question.
+Gemini Live input transcription is displayed as user text.
 
-Slide narration is excluded from chat history.
+Gemini Live output transcription is accumulated for the current response and displayed as presenter text when the turn finishes.
 
-The history lives in browser memory and resets when a different deck is opened. The backend therefore remains stateless and does not need Redis, session affinity, or a conversation database.
-
-## Provider split
-
-| Work | Primary | Fallback |
-|---|---|---|
-| Full deck narration script | Gemini 3.5 Flash-Lite | Gemini 3.8 Flash, then Groq |
-| Slide routing + Q&A | Gemini 3.8 Flash, low thinking | existing non-stream Gemini/Groq path |
-| Narration and answer voice | Gemini 3.8 Flash TTS | Gemini 3.8 Flash-Lite TTS |
-| Real-time speech turns | Deepgram Flux | Silero + short Groq Whisper request |
-
-Gemini still does the core intelligence and all generated voice. Deepgram is used only for real-time speech turn detection/transcription.
-
-## Cost controls
-
-The design avoids repeated work:
-
-- deck narration text is generated once per browser cache version
-- slide narration TTS is generated once per browser cache version
-- normal slide playback has no model call
-- Silero runs locally
-- silence is not sent to Deepgram
-- only detected speech is streamed to Flux
-- Q&A uses one Gemini reasoning stream
-- chat context is capped at six messages
-- no vector database
-- no agent planner/tool loop
-- no server-side conversation state
-
-The first preparation of a deck intentionally costs more than the previous two-slide lookahead approach. In exchange, every actual presentation run is substantially smoother and repeat runs avoid those narration/TTS calls.
-
-For shared production caching across many users, move prepared narration assets from browser IndexedDB into object storage/CDN. The application contract would not change; only the cache implementation would.
-
-## Scalability
-
-FastAPI remains stateless. Vercel instances can process requests independently.
-
-Static slide images are already pre-rendered. Runtime servers do not parse or render PowerPoint files.
-
-Deepgram's long-lived credential stays server-side; only short-lived browser tokens are minted.
-
-For public traffic, the next additions should be:
-
-- authentication
-- per-user rate limits
-- provider spend alerts
-- shared CDN/object storage for pre-generated deck audio
-- structured latency metrics for VAD → EOT → first slide route → first TTS audio
+The Live session itself carries the conversation context.
 
 ## Code layout
 
-- `frontend/src/App.tsx` — presentation orchestration
-- `frontend/src/cache.ts` — IndexedDB prepared-deck cache
-- `frontend/src/realtime.ts` — Silero VAD + Flux streaming
-- `frontend/src/voice.ts` — audio duck/interrupt/playback
-- `frontend/src/api.ts` — backend HTTP/SSE helpers
-- `backend/main.py` — deck loading and provider endpoints
+    frontend/src/App.tsx
+        presentation sequence
+        interruption/resume state
+        conversation UI
 
-There is no hidden agent framework. Each step maps directly to one file and one responsibility.
+    frontend/src/live.ts
+        ephemeral-token Live WebSocket
+        microphone capture
+        PCM conversion
+        server interruption handling
+        output audio playback
+        show_slide tool
+
+    frontend/src/api.ts
+        deck requests
+        Live token request
+
+    backend/main.py
+        deck endpoints
+        ephemeral Live token endpoint
+
+Old cascade components have been removed:
+- Deepgram Flux
+- Groq Whisper
+- Silero VAD
+- separate Gemini TTS endpoint
+- IndexedDB narration cache
+- streamed Flash Q&A endpoint
+- manual chat-history window
+
+## Scalability
+
+The backend is stateless and nearly idle during a presentation. Audio travels directly between the browser and Gemini.
+
+Backend work is limited to:
+- loading deck JSON
+- minting a short-lived Live token
+
+No sticky session, Redis, audio proxy, or speech storage is required.
+
+## Cost model
+
+A presentation uses one Gemini Live session while it is active. This removes duplicated STT + text-model + TTS provider usage.
+
+Close the session as soon as:
+- Stop presentation is pressed
+- the user goes back
+- the component unmounts
+
+## Debugging
+
+If the session does not open:
+- check GET /api/health
+- check POST /api/live-token
+- inspect the browser WebSocket to generativelanguage.googleapis.com
+
+If mic input works but barge-in does not:
+- verify microphone permission
+- verify realtimeInput audio is continuously sent
+- verify activityHandling is START_OF_ACTIVITY_INTERRUPTS
+
+If Gemini interrupts itself:
+- test with headphones
+- verify browser echoCancellation is enabled
+- increase prefixPaddingMs before adding another VAD system
+
+If the wrong slide appears:
+- inspect show_slide calls
+- improve slide text/system instruction first
+- do not add a vector database for 53 fixed slides
+
+## Acceptance test
+
+1. Click Present from here.
+2. Gemini presents slide 1.
+3. While Gemini is speaking, ask a question naturally.
+4. Gemini audio stops when the Live API commits the interruption.
+5. Gemini calls show_slide if another slide is more relevant.
+6. Gemini answers in native Live audio.
+7. The app returns to the interrupted presentation slide and resumes.
+8. Stop presentation immediately ends audio and microphone processing.
