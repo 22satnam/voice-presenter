@@ -12,7 +12,7 @@ There is no PowerPoint uploader. Text is extracted from each supplied PPTX and k
 
 Select a presentation and press **Present from here**. The backend writes a short explanation for each slide using Gemini (primary) and Groq (fallback). Groq Orpheus speaks the text; browser speech is the fallback. The app waits for speech to finish before going to the next slide. **Stop presentation** cancels generation, audio and further slide changes. You can click any slide, ask a typed question, or use Chrome/Edge voice input to ask a question. A question chooses a relevant slide and speaks the response.
 
-No telemetry dashboard, generated demo traffic, drag-and-drop uploader, or always-on microphone.
+No telemetry dashboard, generated demo traffic, or drag-and-drop uploader. Selecting a deck starts voice listening automatically when browser permissions allow it. During narration, say “Presenter, ...” to ask a question without triggering on the presenter's own audio. The microphone button can turn listening off or back on.
 
 ## Local setup
 
@@ -48,7 +48,7 @@ Use the same repository in **two Vercel projects**:
 | Web | `frontend` | Vite | `VITE_API_BASE=https://YOUR-API.vercel.app` |
 | API | `backend` | FastAPI | `GEMINI_API_KEY`, `GROQ_API_KEY`, `FRONTEND_ORIGIN=https://YOUR-WEB.vercel.app` |
 
-Optional backend vars: `GEMINI_MODEL=gemini-2.5-flash-lite`, `GROQ_ANSWER_MODEL=openai/gpt-oss-20b`.
+Optional backend vars: `GEMINI_MODEL=gemini-3.5-flash-lite`, `GROQ_ANSWER_MODEL=openai/gpt-oss-20b`.
 
 **Keep API keys only in the backend project.** Add them to Production and redeploy. Browser audio requires a user click; the Present/Ask buttons initiate that permission. Voice input depends on browser recognition support; typing always works.
 
