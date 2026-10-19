@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, type Answer, type Deck, type DeckItem } from './api';
+import { api, transcribeAudio, type Answer, type Deck, type DeckItem } from './api';
 import { Speaker } from './voice';
+import { Listener } from './listener';
 
-type Message = { role: 'Presenter' | 'You'; text: string; slide?: number };
+type Message = { role: 'Presenter' | 'You'; text: string; slide?: number; kind?: 'narration' };
 
 export default function App() {
   const [decks, setDecks] = useState<DeckItem[]>([]);
@@ -14,40 +15,42 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [error, setError] = useState('');
   const [voice, setVoice] = useState('');
-  const [listening, setListening] = useState(false);
+  const [micStatus, setMicStatus] = useState('Mic off');
+  const [messagesRef] = useState(() => ({ current: [] as Message[] }));
   const abort = useRef<AbortController | null>(null);
   const speaker = useRef(new Speaker());
-  const speechRecognition = useRef<any>(null);
+  const listener = useRef<Listener | null>(null);
+  const transcription = useRef<AbortController | null>(null);
   const current = useRef(0);
-  const micWanted = useRef(false);
-  const speaking = useRef(false);
+
   const askRef = useRef<(text: string) => void>(() => {});
 
   useEffect(() => {
     api<DeckItem[]>('/api/decks').then(setDecks).catch(e => setError(e.message));
-    return () => { micWanted.current = false; abort.current?.abort(); speaker.current.stop(); speechRecognition.current?.abort?.(); };
+    return () => { abort.current?.abort(); transcription.current?.abort(); speaker.current.stop(); listener.current?.stop(); };
   }, []);
 
   function stop() {
     abort.current?.abort();
     abort.current = null;
     speaker.current.stop();
-    speaking.current = false;
+    transcription.current?.abort();
     setRunning(false);
     setBusy(false);
   }
 
   async function openDeck(id: string) {
     stop();
+    setError('');
     speaker.current.unlock();
     startListening();
-    setError('');
     setBusy(true);
     try {
       const picked = await api<Deck>('/api/decks/' + id);
       setDeck(picked);
       setSlide(0);
       current.current = 0;
+      messagesRef.current = [];
       setMessages([]);
       setVoice('');
     } catch (err) {
@@ -55,6 +58,11 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  function addMessage(message: Message) {
+    messagesRef.current = [...messagesRef.current, message];
+    setMessages(messagesRef.current);
   }
 
   function selectSlide(index: number) {
@@ -80,11 +88,11 @@ export default function App() {
         const result = await api<{ text: string; provider: string }>('/api/narrate',
           { deck_id: deck.id, slide_index: index }, controller.signal);
         if (controller.signal.aborted) break;
-        setMessages(old => [...old, { role: 'Presenter', text: result.text, slide: index + 1 }]);
+        addMessage({ role: 'Presenter', text: result.text, slide: index + 1, kind: 'narration' });
         setBusy(false);
-        speaking.current = true;
+        listener.current?.pause(true);
         try { await speaker.current.speak(result.text, controller.signal, setVoice); }
-        finally { speaking.current = false; }
+        finally { listener.current?.pause(false); }
       } catch (err) {
         if (!controller.signal.aborted) {
           setError(err instanceof Error ? err.message : 'Could not present this slide');
@@ -119,19 +127,21 @@ export default function App() {
     setQuestion('');
     setError('');
     setBusy(true);
-    setMessages(old => [...old, { role: 'You', text }]);
+    const history = messagesRef.current.filter(m => m.kind !== 'narration')
+      .slice(-6).map(m => ({ role: m.role === 'You' ? 'user' : 'assistant', text: m.text }));
+    addMessage({ role: 'You', text });
     try {
       const reply = await api<Answer>('/api/ask',
-        { deck_id: deck.id, current_slide: current.current, question: text }, controller.signal);
+        { deck_id: deck.id, current_slide: current.current, question: text, history }, controller.signal);
       if (controller.signal.aborted) return;
       setSlide(reply.slide_index);
       current.current = reply.slide_index;
-      setMessages(old => [...old, { role: 'Presenter', text: reply.answer, slide: reply.slide_number }]);
+      addMessage({ role: 'Presenter', text: reply.answer, slide: reply.slide_number });
       setBusy(false);
       setRunning(true);
-      speaking.current = true;
+      listener.current?.pause(true);
       try { await speaker.current.speak(reply.answer, controller.signal, setVoice); }
-      finally { speaking.current = false; }
+      finally { listener.current?.pause(false); }
     } catch (err) {
       if (!controller.signal.aborted) setError(err instanceof Error ? err.message : 'Unable to answer');
     } finally {
@@ -143,70 +153,33 @@ export default function App() {
     }
   }
 
-  // Keep voice input on while a deck is open. The mic button is only needed
-  // when the browser blocks automatic permission or the user turns it off.
   function startListening() {
-    const Speech = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!Speech) {
-      setError('This browser does not support speech recognition. You can still type questions.');
-      return;
-    }
-    micWanted.current = true;
-    if (speechRecognition.current) return;
-    const recognition = new Speech();
-    speechRecognition.current = recognition;
-    recognition.lang = 'en-IN';
-    recognition.continuous = true;
-    recognition.interimResults = false;
-    recognition.onresult = (event: any) => {
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        if (!event.results[i].isFinal) continue;
-        const heard = String(event.results[i][0].transcript || '').trim();
-        if (!heard) continue;
-        // Don't mistake the presenter's own audio for a question.
-        // During narration say "Presenter, ..." to interrupt.
-        const wake = heard.match(/^(?:hey\s+)?presenter[,.:]?\s*(.+)/i);
-        if (speaking.current && !wake) continue;
-        askRef.current(wake ? wake[1] : heard);
-        break;
+    listener.current ||= new Listener(async audio => {
+      const controller = new AbortController();
+      transcription.current = controller;
+      try {
+        const text = await transcribeAudio(audio, controller.signal);
+        if (!controller.signal.aborted && text.trim()) askRef.current(text.trim());
+      } finally {
+        if (transcription.current === controller) transcription.current = null;
       }
-    };
-    recognition.onerror = (event: any) => {
-      if (['not-allowed', 'service-not-allowed', 'network', 'audio-capture'].includes(event.error)) {
-        micWanted.current = false;
-        setListening(false);
-        setError('Voice input could not start (' + event.error + '). Check microphone permission or use typed questions.');
-      }
-    };
-    recognition.onend = () => {
-      if (speechRecognition.current === recognition) speechRecognition.current = null;
-      setListening(false);
-      if (micWanted.current) window.setTimeout(startListening, 400);
-    };
-    try {
-      recognition.start();
-      setListening(true);
-    } catch {
-      speechRecognition.current = null;
-      micWanted.current = false;
-      setListening(false);
-    }
+    }, setMicStatus, message => setError(message));
+
+    void listener.current.start().catch(error => {
+      setMicStatus('Mic off');
+      setError(error instanceof Error ? error.message : 'Microphone could not start');
+    });
   }
 
-  function toggleMicOff() {
-    micWanted.current = false;
-    speechRecognition.current?.abort?.();
-    speechRecognition.current = null;
-    setListening(false);
+  function stopListening() {
+    transcription.current?.abort();
+    listener.current?.stop();
+    setMicStatus('Mic off');
   }
 
   function toggleMic() {
-    if (micWanted.current) {
-      toggleMicOff();
-    } else {
-      setError('');
-      startListening();
-    }
+    if (micStatus !== 'Mic off') stopListening();
+    else { setError(''); startListening(); }
   }
   askRef.current = text => { void ask(text); };
 
@@ -229,8 +202,8 @@ export default function App() {
   return (
     <main className="presenter">
       <header className="toolbar">
-        <button onClick={() => { stop(); toggleMicOff(); setDeck(null); }}>← Back</button>
-        <div className="heading"><strong>{deck.title}</strong><small>Slide {slide + 1} of {deck.slides.length}{voice ? ` · ${voice}` : ''}{listening ? ' · Mic on' : ' · Mic off'}</small></div>
+        <button onClick={() => { stop(); stopListening(); setDeck(null); }}>← Back</button>
+        <div className="heading"><strong>{deck.title}</strong><small>Slide {slide + 1} of {deck.slides.length}{voice ? ` · ${voice}` : ''}{` · ${micStatus}`}</small></div>
         <div className="actions">
           {!running ? <button className="primary" onClick={() => void present()}>▶ Present from here</button>
             : <button className="stop" onClick={stop}>■ Stop presentation</button>}
@@ -263,7 +236,7 @@ export default function App() {
           <form className="ask" onSubmit={event => { event.preventDefault(); void ask(question); }}>
             <input value={question} onChange={event => setQuestion(event.target.value)} placeholder="Ask about this presentation…" aria-label="Ask a question" />
             <button type="submit" disabled={!question.trim() || busy}>Ask</button>
-            <button type="button" onClick={toggleMic} title={listening ? 'Turn microphone off' : 'Turn microphone on'} aria-label={listening ? 'Turn microphone off' : 'Turn microphone on'}>{listening ? '🎙 On' : '🎙 Off'}</button>
+            <button type="button" onClick={toggleMic} title={micStatus !== 'Mic off' ? 'Turn microphone off' : 'Turn microphone on'} aria-label={micStatus !== 'Mic off' ? 'Turn microphone off' : 'Turn microphone on'}>{micStatus !== 'Mic off' ? '🎙 On' : '🎙 Off'}</button>
           </form>
         </aside>
       </section>
