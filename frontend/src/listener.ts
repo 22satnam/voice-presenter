@@ -1,4 +1,4 @@
-type Status = 'Listening' | 'Processing' | 'Mic off';
+type Status = 'Listening' | 'Processing' | 'Mic paused' | 'Mic off';
 
 export class Listener {
   private stream: MediaStream | null = null;
@@ -47,7 +47,7 @@ export class Listener {
   pause(value: boolean) {
     this.paused = value;
     if (value && this.recording) this.finish(true);
-    if (!value && this.running && !this.processing) this.onStatus('Listening');
+    if (this.running) this.onStatus(value ? 'Mic paused' : (this.processing ? 'Processing' : 'Listening'));
   }
 
   stop() {
