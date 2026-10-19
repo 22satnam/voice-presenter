@@ -1,119 +1,120 @@
 # Voice Presenter
 
-A React + FastAPI voice-presentation demo for three fixed decks:
+A small React + FastAPI demo for three fixed presentation decks using Gemini 3.8 Live.
 
-- Business Market Analysis — 20 slides
-- Print Media Advertising — 18 slides
-- Diabetes Mellitus — 15 slides
+## What it does
 
-The original PowerPoints are not parsed at runtime. Slide images are pre-rendered in `frontend/public/slides`, and extracted slide text lives in `backend/decks`.
+- The user chooses a deck and clicks Present from here.
+- The browser opens one Gemini Live session.
+- The complete deck content is supplied to that session as context.
+- React tells Gemini which slide to present next.
+- Gemini calls the local show_slide tool before discussing a slide.
+- The browser streams microphone audio directly to Gemini Live.
+- Gemini uses native server-side VAD and barge-in.
+- If the user speaks while Gemini is talking, Gemini interrupts its own response and the browser clears queued audio immediately.
+- If a question belongs to another slide, Gemini calls show_slide for that slide before answering.
+- After the answer, React tells Gemini to resume the interrupted presentation slide.
+- Input and output transcriptions are shown in the conversation panel.
+- Stop presentation closes the Live session and microphone immediately.
 
-## Runtime behavior
+There is no separate STT provider, no separate TTS provider, no Deepgram, no Groq runtime path, no Silero VAD, no narration cache, no vector database, and no agent framework.
 
-Opening a deck prepares the presentation once:
+## Architecture
 
-1. Gemini generates the full narration script for the deck.
-2. The browser splits narration into sentences.
-3. Gemini 3.8 Flash TTS generates sentence-level audio.
-4. Narration + audio are cached in IndexedDB.
+    Browser
+      - React slide UI
+      - microphone -> raw PCM 16 kHz
+      - Gemini Live WebSocket
+      - raw PCM 24 kHz playback
+             |
+             | short-lived token
+             v
+    FastAPI / Vercel
+      - GET /api/decks
+      - GET /api/decks/{id}
+      - POST /api/live-token
+             |
+             v
+    Gemini 3.8 Live
+      - native audio input/output
+      - server VAD and barge-in
+      - transcription
+      - session conversation context
+      - show_slide function calling
 
-The first preparation shows visible progress. Later runs on the same browser reuse the cache, so normal slide-to-slide playback does not wait for LLM or TTS calls.
+## Why Gemini Live
 
-During a presentation:
-
-- slides play in sequence
-- Silero VAD runs locally
-- user speech immediately ducks the presenter
-- confirmed speech interrupts the current sentence
-- Deepgram Flux handles real-time turn detection when configured
-- Gemini 3.8 Flash chooses the relevant slide and streams the answer
-- the slide changes before the answer is spoken
-- answer TTS is generated sentence-by-sentence
-- the interrupted narration resumes from the interrupted sentence
-- the last six Q&A messages are kept for follow-up continuity
-- **Stop presentation** stops audio and mic processing immediately
-
-## Providers
-
-| Work | Primary |
-|---|---|
-| Deck narration | Gemini 3.5 Flash-Lite |
-| Q&A / slide routing | Gemini 3.8 Flash, low thinking |
-| Voice | Gemini 3.8 Flash TTS |
-| Real-time STT | Deepgram Flux |
-| STT fallback | Groq Whisper |
-| Text fallback | Groq |
-
-Gemini remains the main intelligence and voice provider. Deepgram is only used for low-latency speech turn detection/transcription.
+The product is a realtime voice experience. Gemini Live already provides native audio input/output, server-side activity detection, interruption handling, transcription, session context, and function calling. Using those features directly is simpler and lower-latency than maintaining a custom STT -> LLM -> TTS cascade.
 
 ## Local setup
 
 Backend:
 
-```bash
-cd backend
-python -m venv .venv
-# activate .venv
-pip install -r requirements.txt
-cp .env.example .env
-uvicorn main:app --reload --port 8000
-```
+    cd backend
+    python -m venv .venv
+    # activate the venv
+    pip install -r requirements.txt
+    cp .env.example .env
+    uvicorn main:app --reload --port 8000
+
+Backend environment:
+
+    GEMINI_API_KEY=...
+    GEMINI_LIVE_MODEL=gemini-3.8-live
+    FRONTEND_ORIGIN=http://localhost:5173
 
 Frontend:
 
-```bash
-cd frontend
-npm install
-cp .env.example .env.local
-npm run dev
-```
+    cd frontend
+    npm install
+    cp .env.example .env.local
+    npm run dev
 
-Set `VITE_API_BASE=http://localhost:8000` in `frontend/.env.local`.
+Frontend environment:
 
-## Required backend variables
+    VITE_API_BASE=http://localhost:8000
 
-```text
-GEMINI_API_KEY=...
-DEEPGRAM_API_KEY=...
-GROQ_API_KEY=...
-FRONTEND_ORIGIN=http://localhost:5173
-```
+## Production
 
-Recommended model configuration:
+Two Vercel projects use the same repository.
 
-```text
-GEMINI_MODEL=gemini-3.8-flash
-GEMINI_NARRATION_MODEL=gemini-3.5-flash-lite
-GEMINI_TTS_MODEL=gemini-3.8-flash-tts
-GEMINI_TTS_VOICE=Sulafat
-GROQ_ANSWER_MODEL=openai/gpt-oss-20b
-```
+Frontend:
+- project: voice-presenter
+- root: frontend
+- env: VITE_API_BASE=https://voice-presenter-api.vercel.app
 
-The Deepgram API key must stay on the backend. The browser requests a short-lived token from `/api/deepgram-token`; the long-lived key is never shipped in frontend code.
+Backend:
+- project: voice-presenter-api
+- root: backend
+- env: GEMINI_API_KEY, GEMINI_LIVE_MODEL, FRONTEND_ORIGIN
 
-If Deepgram is not configured, the app can still use the short batch STT fallback, but Flux turn detection will not be active.
+The Gemini API key is never sent to the browser. The backend mints a one-use short-lived Live token. The browser then connects directly to Gemini with that token.
 
-## Vercel
+## Main files
 
-Use the same repository in two projects:
+    frontend/src/App.tsx   presentation state and UI
+    frontend/src/live.ts  Gemini Live WebSocket, mic PCM, playback, slide tool
+    frontend/src/api.ts   deck and token requests
+    backend/main.py       decks and ephemeral token endpoint
 
-| Project | Root | Environment |
-|---|---|---|
-| Frontend | `frontend` | `VITE_API_BASE=https://voice-presenter-api.vercel.app` |
-| Backend | `backend` | Gemini / Deepgram / Groq keys + `FRONTEND_ORIGIN` |
-
-Never expose provider keys as `VITE_*` variables.
-
-## Design notes
-
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for the barge-in flow, cache strategy, provider split, cost controls, and scaling rationale.
+That is the runtime.
 
 ## Tests
 
-```bash
-cd backend
-pip install -r requirements-dev.txt
-pytest -q
-```
+Backend:
 
-Browser microphone behavior and real-time provider latency still need to be measured in the target browser/device.
+    cd backend
+    pip install -r requirements-dev.txt
+    pytest -q
+
+Frontend:
+
+    cd frontend
+    npm install
+    npm run build
+
+Current validation:
+- frontend production build passes
+- backend tests: 4 passed
+
+See ARCHITECTURE.md for the state flow and debugging notes.
