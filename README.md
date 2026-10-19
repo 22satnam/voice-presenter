@@ -1,55 +1,54 @@
 # Voice Presenter
 
-A small React + FastAPI demo for three fixed decks:
+A React + FastAPI voice-presentation demo for three fixed decks:
 
 - Business Market Analysis — 20 slides
 - Print Media Advertising — 18 slides
 - Diabetes Mellitus — 15 slides
 
-The images are pre-rendered from the supplied PowerPoints. Deck text lives in `backend/decks`. No uploader or slide-generation pipeline runs in production.
+The original PowerPoints are not parsed at runtime. Slide images are pre-rendered in `frontend/public/slides`, and extracted slide text lives in `backend/decks`.
 
-## How it works
+## Runtime behavior
 
-```
-Browser (React)
-  ├── Present / Stop / slide navigation
-  ├── Microphone → silence detection → short audio clip
-  ├── Last six chat messages (in memory, current deck only)
-  └── Gemini audio player
-          │
-          ▼
-FastAPI (Vercel, stateless)
-  ├── /api/stt      → Groq Whisper Large v3 Turbo
-  ├── /api/ask      → Gemini 3.5 Flash-Lite → Groq fallback
-  ├── /api/narrate  → Gemini 3.5 Flash-Lite → Groq fallback
-  └── /api/tts      → Gemini 3.8 Flash TTS → Gemini 3.8 Flash-Lite TTS
-```
+Opening a deck prepares the presentation once:
 
-### Voice and conversation
+1. Gemini generates the full narration script for the deck.
+2. The browser splits narration into sentences.
+3. Gemini 3.8 Flash TTS generates sentence-level audio.
+4. Narration + audio are cached in IndexedDB.
 
-Clicking **Present from here** presents slides sequentially. After every two slides (and after the final slide), the presenter pauses and asks for questions. Only during that short Q&A window does the browser listen for speech. If no voice is detected locally, nothing is uploaded and the presentation continues. This avoids the continuous-listening false positives that previously produced transcripts such as "Thank you.".
+The first preparation shows visible progress. Later runs on the same browser reuse the cache, so normal slide-to-slide playback does not wait for LLM or TTS calls.
 
-When a real question is detected, the short recording is transcribed, Gemini chooses the most relevant slide, the UI switches to that slide, and the answer is spoken. The presentation then resumes its original sequence. **Stop presentation** cancels generation, audio, listening, and further slide changes. Typed questions remain available at any time.
+During a presentation:
 
-Questions are resolved against the current presentation's slide titles and content, not a canned script. The last **six** user/assistant chat messages are sent along with each new question for continuity; this small history window is kept **only in browser memory**, reset when another deck is selected, and never written to a database.
+- slides play in sequence
+- Silero VAD runs locally
+- user speech immediately ducks the presenter
+- confirmed speech interrupts the current sentence
+- Deepgram Flux handles real-time turn detection when configured
+- Gemini 3.8 Flash chooses the relevant slide and streams the answer
+- the slide changes before the answer is spoken
+- answer TTS is generated sentence-by-sentence
+- the interrupted narration resumes from the interrupted sentence
+- the last six Q&A messages are kept for follow-up continuity
+- **Stop presentation** stops audio and mic processing immediately
 
-Gemini 3.8 Flash TTS uses the `Sulafat` voice by default; its speech style is warm and conversational. The app uses Google's Interactions TTS API and makes one TTS request per spoken response. If the flagship TTS model is unavailable, the API tries Gemini 3.8 Flash-Lite TTS. There is no robotic browser-speech fallback.
+## Providers
 
-## Why this design
+| Work | Primary |
+|---|---|
+| Deck narration | Gemini 3.5 Flash-Lite |
+| Q&A / slide routing | Gemini 3.8 Flash, low thinking |
+| Voice | Gemini 3.8 Flash TTS |
+| Real-time STT | Deepgram Flux |
+| STT fallback | Groq Whisper |
+| Text fallback | Groq |
 
-- **Simple to explain:** Browser handles controls and audio capture. FastAPI holds API keys, loads deck metadata, and calls providers.
-- **Scalable:** Endpoints are stateless. Session conversation context is provided by the client instead of sticky server sessions, so independent Vercel instances can process requests.
-- **Cost-conscious:** No background STT while TTS speaks; short clips only; 6-message context window; one LLM call to select the slide *and* answer; one Gemini TTS call per response; lightweight Gemini Flash-Lite for most text operations.
-- **Trade-offs:** Audio generation waits for the full text, so there may be a pause before speech starts. Questions are taken at deliberate Q&A checkpoints rather than through always-on full-duplex audio. True barge-in would require an echo-managed streaming architecture such as Gemini Live, which is more complex and less predictable in cost.
-- **Production hardening:** Add user authentication, server-side rate limits, daily budget alerts, and structured error metrics before opening the app to public traffic. The demo does not currently implement those controls.
+Gemini remains the main intelligence and voice provider. Deepgram is only used for low-latency speech turn detection/transcription.
 
-### Approximate TTS API cost
+## Local setup
 
-Google's published paid-tier rates through December 2026 are $9 per million audio-output tokens for Gemini 3.8 Flash TTS (about $0.0135/minute of speech), and $6 per million for Flash-Lite TTS (about $0.009/minute). Text-generation, transcription, hosting, and other usage are additional. Pricing may change: https://ai.google.dev/gemini-api/docs/pricing
-
-## Local development
-
-Run from two terminals (Python 3.11+, Node 20+):
+Backend:
 
 ```bash
 cd backend
@@ -60,6 +59,8 @@ cp .env.example .env
 uvicorn main:app --reload --port 8000
 ```
 
+Frontend:
+
 ```bash
 cd frontend
 npm install
@@ -67,24 +68,45 @@ cp .env.example .env.local
 npm run dev
 ```
 
-Set `VITE_API_BASE=http://localhost:8000` in the frontend and use `http://localhost:5173`.
+Set `VITE_API_BASE=http://localhost:8000` in `frontend/.env.local`.
 
-## Vercel deployments
+## Required backend variables
 
-Use the same repo in two projects:
+```text
+GEMINI_API_KEY=...
+DEEPGRAM_API_KEY=...
+GROQ_API_KEY=...
+FRONTEND_ORIGIN=http://localhost:5173
+```
 
-| Project | Root | Configuration |
+Recommended model configuration:
+
+```text
+GEMINI_MODEL=gemini-3.8-flash
+GEMINI_NARRATION_MODEL=gemini-3.5-flash-lite
+GEMINI_TTS_MODEL=gemini-3.8-flash-tts
+GEMINI_TTS_VOICE=Sulafat
+GROQ_ANSWER_MODEL=openai/gpt-oss-20b
+```
+
+The Deepgram API key must stay on the backend. The browser requests a short-lived token from `/api/deepgram-token`; the long-lived key is never shipped in frontend code.
+
+If Deepgram is not configured, the app can still use the short batch STT fallback, but Flux turn detection will not be active.
+
+## Vercel
+
+Use the same repository in two projects:
+
+| Project | Root | Environment |
 |---|---|---|
-| Frontend | `frontend` (Vite) | `VITE_API_BASE` points to production API |
-| Backend | `backend` (FastAPI) | `GEMINI_API_KEY`, `GROQ_API_KEY`, `FRONTEND_ORIGIN` |
+| Frontend | `frontend` | `VITE_API_BASE=https://voice-presenter-api.vercel.app` |
+| Backend | `backend` | Gemini / Deepgram / Groq keys + `FRONTEND_ORIGIN` |
 
-Optional backend variables:
-- `GEMINI_MODEL=gemini-3.5-flash-lite` — text generation.
-- `GEMINI_TTS_MODEL=gemini-3.8-flash-tts` — premium expressive speech.
-- `GEMINI_TTS_VOICE=Sulafat` — voice preset.
-- `GROQ_ANSWER_MODEL=openai/gpt-oss-20b` — fallback text model.
+Never expose provider keys as `VITE_*` variables.
 
-Never use a `VITE_` prefix for API keys.
+## Design notes
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the barge-in flow, cache strategy, provider split, cost controls, and scaling rationale.
 
 ## Tests
 
@@ -94,7 +116,4 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Live audio playback, microphone permissions, and provider quotas must be checked in a real browser after deployment.
-
-
-For the implementation rationale, scalability decisions, provider split, and cost controls, see [`ARCHITECTURE.md`](./ARCHITECTURE.md).
+Browser microphone behavior and real-time provider latency still need to be measured in the target browser/device.
