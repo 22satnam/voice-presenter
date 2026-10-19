@@ -3,6 +3,7 @@ import { createLiveToken, type Deck } from "./api";
 type LiveCallbacks = {
   onStatus: (status: string) => void;
   onSlide: (slideIndex: number) => void;
+  onUserActivity: () => void;
   onUserText: (text: string) => void;
   onModelText: (text: string) => void;
   onInterrupted: () => void;
@@ -293,6 +294,8 @@ export class GeminiLivePresenter {
       return;
     }
 
+    if (message.voiceActivity) this.callbacks.onUserActivity();
+
     if (message.toolCall?.functionCalls) {
       this.handleToolCalls(message.toolCall.functionCalls as ToolCall[]);
     }
@@ -306,7 +309,10 @@ export class GeminiLivePresenter {
       this.callbacks.onInterrupted();
     }
 
+    if (content.interimInputTranscription?.text) this.callbacks.onUserActivity();
+
     if (content.inputTranscription?.text) {
+      this.callbacks.onUserActivity();
       this.callbacks.onUserText(content.inputTranscription.text.trim());
     }
 
