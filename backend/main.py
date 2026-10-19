@@ -2,10 +2,12 @@
 
 import base64
 from functools import lru_cache
+import io
 import json
 import logging
 import os
 import re
+import wave
 from pathlib import Path
 from typing import Literal
 
@@ -444,15 +446,29 @@ async def transcribe(file: UploadFile = File(...)):
         raise HTTPException(502, 'Could not transcribe audio; type your question instead') from exc
 
 
+def pcm_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
+    """Wrap legacy Gemini raw 16-bit mono PCM so browsers can decode it."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(pcm)
+    return buffer.getvalue()
+
+
 @app.post('/api/tts')
 async def tts(req: SpeechInput):
-    """Generate a complete WAV using Gemini 3.8 TTS."""
+    """Gemini 3.8 voice first, with a temporary legacy Gemini fallback for quota spikes."""
     key = os.getenv('GEMINI_API_KEY')
     if not key:
         raise HTTPException(503, 'Gemini voice is not configured')
 
-    models = list(dict.fromkeys([TTS_MODEL, 'gemini-3.8-flash-lite-tts']))
-    for model in models:
+    rate_limited = False
+    retry_after = None
+
+    # The 3.8 models share the modern Interactions schema.
+    for model in list(dict.fromkeys([TTS_MODEL, 'gemini-3.8-flash-lite-tts'])):
         body = {
             'model': model,
             'input': [{
@@ -469,6 +485,7 @@ async def tts(req: SpeechInput):
             'response_format': {'type': 'audio'},
             'generation_config': {'speech_config': [{'voice': TTS_VOICE}]},
         }
+
         try:
             async with httpx.AsyncClient(timeout=50) as client:
                 response = await client.post(
@@ -479,26 +496,78 @@ async def tts(req: SpeechInput):
                 response.raise_for_status()
 
             output = response.json()
-            encoded = None
-            for step in output.get('steps', []):
-                if step.get('type') != 'model_output':
-                    continue
-                for item in step.get('content', []):
-                    if item.get('type') == 'audio' and item.get('data'):
-                        encoded = item['data']
-            if not encoded:
-                raise ValueError('Gemini returned no audio')
-
+            encoded = next(
+                item['data']
+                for step in output.get('steps', [])
+                if step.get('type') == 'model_output'
+                for item in step.get('content', [])
+                if item.get('type') == 'audio' and item.get('data')
+            )
             audio = base64.b64decode(encoded)
             if audio[:4] != b'RIFF':
-                raise ValueError('Gemini did not return WAV audio')
+                raise ValueError('Gemini 3.8 did not return WAV audio')
+
             return Response(
                 content=audio,
                 media_type='audio/wav',
                 headers={'X-Voice-Provider': model, 'Cache-Control': 'no-store'},
             )
-        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-            code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
-            logger.warning('Gemini voice model %s unavailable (%s)', model, code)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, StopIteration) as exc:
+            status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+            if status == 429:
+                rate_limited = True
+                retry_after = exc.response.headers.get('retry-after') or retry_after
+            logger.warning('Gemini voice model %s unavailable (%s)', model, status or type(exc).__name__)
+
+    # Emergency Gemini-only fallback while 3.8 speech quota is cooling down.
+    # This preview model is temporary and should be removed after 3.8 quota is stable.
+    legacy_model = 'gemini-3.1-flash-tts-preview'
+    legacy_body = {
+        'contents': [{
+            'parts': [{'text': req.text}],
+        }],
+        'generationConfig': {
+            'responseModalities': ['AUDIO'],
+            'speechConfig': {
+                'voiceConfig': {
+                    'prebuiltVoiceConfig': {'voiceName': 'Kore'},
+                },
+            },
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=50) as client:
+            response = await client.post(
+                f'https://generativelanguage.googleapis.com/v1beta/models/{legacy_model}:generateContent',
+                headers={'x-goog-api-key': key},
+                json=legacy_body,
+            )
+            response.raise_for_status()
+
+        encoded = response.json()['candidates'][0]['content']['parts'][0]['inlineData']['data']
+        audio = base64.b64decode(encoded)
+        if audio[:4] != b'RIFF':
+            audio = pcm_to_wav(audio)
+
+        return Response(
+            content=audio,
+            media_type='audio/wav',
+            headers={'X-Voice-Provider': legacy_model, 'Cache-Control': 'no-store'},
+        )
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError) as exc:
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        if status == 429:
+            rate_limited = True
+            retry_after = exc.response.headers.get('retry-after') or retry_after
+        logger.warning('Gemini legacy voice fallback unavailable (%s)', status or type(exc).__name__)
+
+    headers = {'Retry-After': retry_after} if retry_after else None
+    if rate_limited:
+        raise HTTPException(
+            status_code=429,
+            detail='Gemini voice is rate-limited right now. Preparation is throttled; retry shortly.',
+            headers=headers,
+        )
 
     raise HTTPException(502, 'Gemini voice unavailable. Please retry shortly')
