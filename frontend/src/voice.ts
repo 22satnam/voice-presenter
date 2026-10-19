@@ -1,8 +1,16 @@
 import { speechAudio } from './api';
 
+export type PlayResult = {
+  status: 'done' | 'interrupted';
+  offset: number;
+};
+
 type Playback = {
   source: AudioBufferSourceNode;
+  startedAt: number;
+  offset: number;
   interrupted: boolean;
+  interruptedAt: number;
   cancelled: boolean;
 };
 
@@ -48,10 +56,14 @@ export class Speaker {
 
   interrupt() {
     const state = this.active;
-    if (!state) return false;
+    const context = this.context;
+    if (!state || !context) return null;
+
+    const elapsed = Math.max(0, context.currentTime - state.startedAt);
+    state.interruptedAt = state.offset + elapsed;
     state.interrupted = true;
     try { state.source.stop(); } catch { /* already ended */ }
-    return true;
+    return state.interruptedAt;
   }
 
   stop() {
@@ -65,21 +77,31 @@ export class Speaker {
     buffer: AudioBuffer,
     signal: AbortSignal,
     onVoiceChange?: (voice: string) => void,
-  ): Promise<'done' | 'interrupted'> {
+    offset = 0,
+  ): Promise<PlayResult> {
     if (signal.aborted) throw new DOMException('Stopped', 'AbortError');
 
     this.unlock();
     this.restore();
     const context = this.context!;
     await context.resume();
+
+    const safeOffset = Math.max(0, Math.min(offset, Math.max(0, buffer.duration - 0.02)));
     onVoiceChange?.('Gemini voice');
 
-    return new Promise<'done' | 'interrupted'>((resolve, reject) => {
+    return new Promise<PlayResult>((resolve, reject) => {
       const source = context.createBufferSource();
       source.buffer = buffer;
       source.connect(this.gain!);
 
-      const state: Playback = { source, interrupted: false, cancelled: false };
+      const state: Playback = {
+        source,
+        startedAt: context.currentTime,
+        offset: safeOffset,
+        interrupted: false,
+        interruptedAt: safeOffset,
+        cancelled: false,
+      };
       this.active = state;
 
       const abort = () => {
@@ -94,13 +116,15 @@ export class Speaker {
 
         if (signal.aborted || state.cancelled) {
           reject(new DOMException('Stopped', 'AbortError'));
+        } else if (state.interrupted) {
+          resolve({ status: 'interrupted', offset: state.interruptedAt });
         } else {
-          resolve(state.interrupted ? 'interrupted' : 'done');
+          resolve({ status: 'done', offset: buffer.duration });
         }
       };
 
       signal.addEventListener('abort', abort, { once: true });
-      source.start();
+      source.start(0, safeOffset);
     });
   }
 }
