@@ -27,20 +27,20 @@ FastAPI (Vercel, stateless)
 
 ### Voice and conversation
 
-Opening a deck requests microphone access (browser permission is always required). Listening starts automatically after permission is granted. The app captures speech locally, detects a pause, and sends **only short clips** for transcription. It does **not** use the browser's cloud SpeechRecognition service.
+Clicking **Present from here** presents slides sequentially. After every two slides (and after the final slide), the presenter pauses and asks for questions. Only during that short Q&A window does the browser listen for speech. If no voice is detected locally, nothing is uploaded and the presentation continues. This avoids the continuous-listening false positives that previously produced transcripts such as "Thank you.".
 
-The microphone pauses while generated audio is playing, to prevent speaker echo from causing accidental questions or extra API costs. To stop narration immediately use **Stop presentation**. After the presenter finishes talking, the mic resumes listening. Speech commands such as "next slide", "previous slide", "go to slide 4", and "stop" work when listening is active. Clicking a slide or typing a question still works.
+When a real question is detected, the short recording is transcribed, Gemini chooses the most relevant slide, the UI switches to that slide, and the answer is spoken. The presentation then resumes its original sequence. **Stop presentation** cancels generation, audio, listening, and further slide changes. Typed questions remain available at any time.
 
 Questions are resolved against the current presentation's slide titles and content, not a canned script. The last **six** user/assistant chat messages are sent along with each new question for continuity; this small history window is kept **only in browser memory**, reset when another deck is selected, and never written to a database.
 
-Gemini 3.8 Flash TTS uses the `Sulafat` voice by default; its speech style is warm and conversational. The TTS request is made once per spoken response, rather than 3–5 calls for small text chunks. If Gemini audio is unavailable, the API tries the Flash-Lite speech model, not robotic system speech.
+Gemini 3.8 Flash TTS uses the `Sulafat` voice by default; its speech style is warm and conversational. The app uses Google's Interactions TTS API and makes one TTS request per spoken response. If the flagship TTS model is unavailable, the API tries Gemini 3.8 Flash-Lite TTS. There is no robotic browser-speech fallback.
 
 ## Why this design
 
 - **Simple to explain:** Browser handles controls and audio capture. FastAPI holds API keys, loads deck metadata, and calls providers.
 - **Scalable:** Endpoints are stateless. Session conversation context is provided by the client instead of sticky server sessions, so independent Vercel instances can process requests.
 - **Cost-conscious:** No background STT while TTS speaks; short clips only; 6-message context window; one LLM call to select the slide *and* answer; one Gemini TTS call per response; lightweight Gemini Flash-Lite for most text operations.
-- **Trade-offs:** Audio generation waits for the full text, so there may be a pause before speech starts. The mic intentionally does not listen over playback. True real-time barge-in would require an echo-managed streaming-audio architecture such as Gemini Live, which is more complex and can have different usage costs.
+- **Trade-offs:** Audio generation waits for the full text, so there may be a pause before speech starts. Questions are taken at deliberate Q&A checkpoints rather than through always-on full-duplex audio. True barge-in would require an echo-managed streaming architecture such as Gemini Live, which is more complex and less predictable in cost.
 - **Production hardening:** Add user authentication, server-side rate limits, daily budget alerts, and structured error metrics before opening the app to public traffic. The demo does not currently implement those controls.
 
 ### Approximate TTS API cost
@@ -95,3 +95,6 @@ pytest -q
 ```
 
 Live audio playback, microphone permissions, and provider quotas must be checked in a real browser after deployment.
+
+
+For the implementation rationale, scalability decisions, provider split, and cost controls, see [`ARCHITECTURE.md`](./ARCHITECTURE.md).
