@@ -1,6 +1,7 @@
 """Small FastAPI backend for the three bundled presentations."""
 
 import base64
+from functools import lru_cache
 import json
 import logging
 import os
@@ -41,9 +42,10 @@ class ChatMessage(BaseModel):
 
 
 class SpeechInput(BaseModel):
-    text: str = Field(min_length=1, max_length=1800)
+    text: str = Field(min_length=1, max_length=950)
 
 
+@lru_cache(maxsize=3)
 def load_deck(deck_id: str):
     if not re.fullmatch(r'[a-z0-9-]+', deck_id):
         raise HTTPException(404, 'Presentation not found')
