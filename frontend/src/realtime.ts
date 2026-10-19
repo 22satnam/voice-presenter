@@ -66,7 +66,7 @@ export class RealtimeVoice {
     try { this.recorder?.stop(); } catch { /* already stopped */ }
     this.recorder = null;
 
-    try { this.flux?.sendCloseStream(); } catch { /* no active Flux turn */ }
+    try { this.flux?.sendCloseStream({ type: 'CloseStream' }); } catch { /* no active Flux turn */ }
     try { this.flux?.close(); } catch { /* already closed */ }
     this.flux = null;
     this.fluxOpening = null;
@@ -187,7 +187,7 @@ export class RealtimeVoice {
     await connection.waitForOpen();
 
     if (this.stopped || !this.speechActive) {
-      connection.sendCloseStream();
+      connection.sendCloseStream({ type: 'CloseStream' });
       connection.close();
       return;
     }
@@ -215,7 +215,7 @@ export class RealtimeVoice {
     if (this.flux) {
       this.flushFluxChunks();
       try {
-        this.flux.sendForceEndTurn();
+        this.flux.sendForceEndTurn({ type: 'ForceEndTurn' });
         return;
       } catch {
         this.closeFluxTurn();
@@ -233,7 +233,7 @@ export class RealtimeVoice {
     this.flux = null;
     this.fluxOpening = null;
     if (!connection) return;
-    try { connection.sendCloseStream(); } catch { /* already closing */ }
+    try { connection.sendCloseStream({ type: 'CloseStream' }); } catch { /* already closing */ }
     try { connection.close(); } catch { /* already closed */ }
   }
 
