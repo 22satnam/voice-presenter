@@ -22,6 +22,7 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
   const [totals, setTotals] = useState<Totals>(ZERO);
   const [toast, setToast] = useState<string | null>(null);
   const [voiceOn, setVoiceOn] = useState(true);
+  const voiceOnRef = useRef(true);
   const [input, setInput] = useState("");
   const [micLive, setMicLive] = useState(false);
   const [error, setError] = useState("");
@@ -106,12 +107,13 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
     const enqueue = (segment: string) => {
       queue = queue.then(async () => {
         if (signal.aborted || run.current !== id) return;
-        const success = !voiceOn || await speaker.current.speak(segment, session, signal);
-        if (!success || signal.aborted || run.current !== id) return;
+        const success = !voiceOnRef.current || await speaker.current.speak(segment, session, signal);
+        if (signal.aborted || run.current !== id) return;
+        if (!success) throw new Error("Speech playback failed. Check your browser audio output and retry.");
         audible = [audible, segment].filter(Boolean).join(" ");
         patch(entry, { text: audible });
         setCaption(audible.slice(-200));
-        if (voiceOn) setTotals((u) => ({ ...u, ttsChars: u.ttsChars + segment.length }));
+        if (voiceOnRef.current) setTotals((u) => ({ ...u, ttsChars: u.ttsChars + segment.length }));
       });
     };
     try {
@@ -129,15 +131,16 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
       }
       if (pending.trim()) enqueue(pending.trim());
       await queue;
+      if (!produced.trim()) throw new Error("The provider returned no narration text.");
       if (!signal.aborted && run.current === id) {
-        if (!voiceOn) patch(entry, { text: produced });
+        patch(entry, { text: produced });
         patch(entry, { meta: `${tokenInfo?.provider || "provider"} · ${tokenInfo?.input_tokens ?? 0} input / ${tokenInfo?.output_tokens ?? 0} output tokens` });
         addUsage(tokenInfo);
         setStatus("listening"); setCaption("");
         return true;
       }
     } catch (e) {
-      if (!signal.aborted) { setError(e instanceof Error ? e.message : "Generation failed"); patch(entry, { interrupted: true }); setStatus("listening"); }
+      if (!signal.aborted) { setError(e instanceof Error ? e.message : "Generation failed"); patch(entry, { text: produced.trim() || "Narration could not be generated.", meta: "Playback or generation failed" }); setStatus("listening"); }
     }
     return false;
   }
@@ -180,6 +183,7 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
 
   async function present(start: number) {
     const { id, signal } = task();
+    if (!voiceOnRef.current) { setError("Unmute audio before starting the presentation."); setAutoPresent(false); return; }
     setAutoPresent(true); setResume(null); setError("");
     for (let i = start; i < deck.slides.length; i++) {
       if (signal.aborted || run.current !== id) return;
@@ -320,7 +324,7 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
           <button onClick={() => void toggleMic()} aria-label={micLive ? "Turn microphone off" : "Enable microphone"} aria-pressed={micLive} className="grid h-12 w-12 place-items-center rounded-full" style={{background:micLive ? "var(--user)":"var(--user-soft)",color:micLive ? "white":"var(--user)"}}><Mic size={20}/></button>
           <div className="flex-1 min-w-[140px] text-sm" style={{color:"var(--ink-2)"}}>{caption || (micLive ? "Microphone active · speak to interrupt or ask" : "Enable mic for hands-free questions, or type below")}</div>
           <button className="btn btn-user" onClick={() => stop("button")} disabled={mode !== "speaking" && mode !== "thinking"}><Hand size={15}/> Interrupt</button>
-          <button className="btn" onClick={() => { setVoiceOn(!voiceOn); speaker.current.cancel(); }} aria-label={voiceOn ? "Mute" : "Unmute"}>{voiceOn ? <Volume2 size={16}/> : <VolumeX size={16}/>}</button>
+          <button className="btn" onClick={() => { const next = !voiceOnRef.current; voiceOnRef.current = next; setVoiceOn(next); if (!next) speaker.current.cancel(); }} aria-label={voiceOn ? "Mute" : "Unmute"}>{voiceOn ? <Volume2 size={16}/> : <VolumeX size={16}/>}</button>
         </div>
         {piiAlert.length > 0 && <div role="status" className="flex items-center gap-2 text-sm" style={{color:"var(--ok)"}}><ShieldCheck size={17}/> Redacted before the LLM: {piiAlert.join(", ")}</div>}
         {error && <p role="alert" className="text-sm" style={{color:"var(--user)"}}>{error}</p>}
