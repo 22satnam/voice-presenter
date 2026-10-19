@@ -1,0 +1,22 @@
+name: Import source bundle
+on:
+  push:
+    paths:
+      - 'source.tar.xz.b64'
+      - '.github/workflows/unpack-source.yml'
+permissions:
+  contents: write
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Extract source and commit
+        run: |
+          base64 --decode source.tar.xz.b64 | tar -xJf -
+          git add -A
+          git diff --cached --quiet && exit 0
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat: import Podium full stack source'
+          git push origin HEAD:main
