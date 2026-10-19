@@ -180,6 +180,8 @@ export class RealtimeVoice {
   private async startVad(stream: MediaStream) {
     this.vad = await MicVAD.new({
       model: 'v6',
+      baseAssetPath: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.31/dist/',
+      onnxWASMBasePath: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
       positiveSpeechThreshold: 0.65,
       negativeSpeechThreshold: 0.42,
       minSpeechMs: 300,
