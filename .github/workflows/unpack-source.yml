@@ -10,12 +10,16 @@ jobs:
   unpack:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: true
       - name: Extract source and commit
         run: |
+          set -euo pipefail
           base64 --decode source.tar.xz.b64 | tar -xJf -
+          # Do not create a new workflow using the restricted CI token.
+          rm -f .github/workflows/ci.yml
+          rm -f source.tar.xz.b64
           git add -A
           git diff --cached --quiet && exit 0
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat: import Podium full stack source'
