@@ -275,16 +275,22 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
         </div>
         <div className="panel relative overflow-hidden">
           <div className="aspect-[16/9] min-h-[290px]">
-            <div key={slide} className="slide-enter flex h-full flex-col px-[6%] py-[5%]">
-              <span className="num text-sm" style={{color:"var(--ink-3)"}}>{slide+1} / {deck.slides.length}</span>
-              <h2 className="mt-3 font-semibold" style={{ fontSize:"clamp(26px,3.8vw,46px)", lineHeight:1.1 }}>{current.title}</h2>
-              <ul className="mt-7 grid gap-3">
-                {current.bullets.map((b,i) => <li key={i} className="flex items-start gap-3 rounded-xl px-3 py-2" style={{background: highlight === i ? "var(--agent-soft)" : "transparent", color:"var(--ink-2)", fontSize:"clamp(14px,1.7vw,21px)"}}><span className="mt-2 h-2 w-2 shrink-0 rounded-full" style={{background:highlight === i ? "var(--agent)" : "var(--line)"}}/>{b}</li>)}
-              </ul>
-            </div>
+            {current.image ? (
+              <img key={slide} className="slide-enter h-full w-full object-contain" src={current.image}
+                alt={`Slide ${slide + 1} of ${deck.slides.length}: ${current.title}`}/>
+            ) : (
+              <div key={slide} className="slide-enter flex h-full flex-col px-[6%] py-[5%]">
+                <span className="num text-sm" style={{color:"var(--ink-3)"}}>{slide+1} / {deck.slides.length}</span>
+                <h2 className="mt-3 font-semibold" style={{fontSize:"clamp(26px,3.8vw,46px)",lineHeight:1.1}}>{current.title}</h2>
+                <ul className="mt-7 grid gap-3">{current.bullets.map((b,i) => <li key={i} className="text-lg" style={{color:highlight===i?"var(--agent)":"var(--ink-2)"}}>{b}</li>)}</ul>
+              </div>
+            )}
           </div>
           {toast && <div className="toast-in absolute right-4 top-4 rounded-xl px-3 py-2 text-sm" style={{background:"var(--ink)",color:"var(--surface)"}}><Zap size={14} className="mr-2 inline"/>{toast}</div>}
         </div>
+        {highlight !== null && <div className="rounded-lg border px-3 py-2 text-sm" style={{background:"var(--agent-soft)",borderColor:"var(--line)",color:"var(--ink)"}}>
+          <span className="font-semibold">Relevant detail:</span> {current.bullets[highlight] ?? current.title}
+        </div>}
         <div className="flex flex-wrap gap-2">
           {deck.slides.map((s,i) => <button key={i} onClick={() => navigate(i,"click")} className="rounded-lg px-3 py-2 text-left text-xs" aria-current={slide===i} style={{background:"var(--surface)",border:slide===i ? "2px solid var(--agent)" : "1px solid var(--line)"}}><span className="num mr-2">{i+1}</span>{s.title.slice(0,24)}</button>)}
         </div>

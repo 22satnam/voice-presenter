@@ -31,16 +31,6 @@ export async function getDeck(id: string): Promise<Deck> {
   return request<Deck>(`/api/decks/${encodeURIComponent(id)}`);
 }
 
-export async function parseDeck(file: File): Promise<Deck> {
-  const data = new FormData(); data.set("file", file);
-  const response = await fetch(API_BASE + "/api/decks/parse", { method: "POST", body: data });
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}));
-    throw new Error(error.detail || "Could not parse PPTX");
-  }
-  return response.json();
-}
-
 export async function* streamText(path: string, body: unknown, signal: AbortSignal): AsyncGenerator<StreamEvent> {
   const response = await fetch(API_BASE + path, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal,

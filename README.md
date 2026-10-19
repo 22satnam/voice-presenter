@@ -1,5 +1,8 @@
 # Podium — Voice Presenter
 
+**Curated decks only.** The three source PowerPoints are `business-report-example.pptx` (7 slides), `ai-value-realization-demo.pptx` (6 slides), and `retail-banking-growth-demo.pptx` (6 slides). Their original visual slide previews are served from `frontend/public/slides/`, retaining charts, tables and layouts. The backend serves extracted shape/chart/table context as JSON, so routing and answers remain deck-aware. No PPTX upload UI or upload API is exposed.
+
+
 A **deck-aware, interruptible AI presenter**. Pick a presentation, ask questions naturally, and watch the assistant route to the most relevant slide **before** generating a live answer. No prerecorded narration or canned answers.
 
 > **Status:** functional full-stack development scaffold. Backend API tests pass. Real Groq/Gemini calls, browser audio, production Vercel builds, and end-to-end interruption have **not** been validated with live credentials here. The bundled three demo PowerPoints are generated from the supplied prototype's sample deck content; replace them with your own originals for a real demo.

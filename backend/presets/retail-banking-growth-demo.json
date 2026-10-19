@@ -1,0 +1,111 @@
+{
+  "id": "retail-banking-growth-demo",
+  "title": "Retail Banking Growth",
+  "blurb": "Consulting demonstration covering primary relationships, customer economics, journey leakage and growth priorities.",
+  "suggestions": [
+    "Summarize this presentation",
+    "Explain the current slide",
+    "What are the key takeaways?",
+    "Next slide"
+  ],
+  "slides": [
+    {
+      "title": "Primary relationships — not acquisition volume — drive the growth gap",
+      "bullets": [
+        "RETAIL BANKING GROWTH",
+        "A six-page consulting demonstration connecting customer economics, journey leakage and a focused growth agenda in an editable PowerPoint.",
+        "The modeled plan reallocates investment toward high-potential households and three decisive journeys."
+      ],
+      "notes": "[Sources]\n- Synthetic demonstration data created for Consulting Deck v0.2. Not a real-world benchmark or forecast.",
+      "narration": "",
+      "keywords": [],
+      "image": "/slides/retail-banking-growth-demo/1.webp"
+    },
+    {
+      "title": "Most of the growth gap comes after acquisition, not before it",
+      "bullets": [
+        "DIAGNOSE THE GAP",
+        "61%",
+        "Post-acquisition gap",
+        "Primary status and cross-sell explain most of the modeled upside.",
+        "Acquisition matters, but the larger prize is converting an acquired customer into a primary relationship.",
+        ": Starting base: 3.2, New customers: 1.1, Activation: 0.7, Primary status: 2.4, Cross-sell: 1.3, Attrition: -0.8"
+      ],
+      "notes": "[Sources]\n- Synthetic demonstration data created for Consulting Deck v0.2. Not a real-world benchmark or forecast.",
+      "narration": "",
+      "keywords": [],
+      "image": "/slides/retail-banking-growth-demo/2.webp"
+    },
+    {
+      "title": "Primary customers create 4.1× more relationship value",
+      "bullets": [
+        "CUSTOMER ECONOMICS",
+        "The economics are nonlinear",
+        "Primary status raises balances, product depth and retention at the same time.",
+        "Growth management should optimize relationship migration, not only product conversion.",
+        ": Primary: 410, Multi-product: 235, Single-product: 100, Dormant: 32"
+      ],
+      "notes": "[Sources]\n- Synthetic demonstration data created for Consulting Deck v0.2. Not a real-world benchmark or forecast.",
+      "narration": "",
+      "keywords": [],
+      "image": "/slides/retail-banking-growth-demo/3.webp"
+    },
+    {
+      "title": "Three customer journeys leak nearly two-thirds of the cross-sell opportunity",
+      "bullets": [
+        "JOURNEY LEAKAGE",
+        "−22 pts",
+        "Offer relevance",
+        "Eligibility rules are broad; next-best-action logic is weak.",
+        "−27 pts",
+        "Engagement",
+        "Outreach is product-led rather than event-led.",
+        "−13 pts",
+        "Activation",
+        "The first-use journey does not reinforce the relationship.",
+        ": Eligible households: 100, Relevant offer: 78, Engaged: 51, Applied: 34, Activated: 21"
+      ],
+      "notes": "[Sources]\n- Synthetic demonstration data created for Consulting Deck v0.2. Not a real-world benchmark or forecast.",
+      "narration": "",
+      "keywords": [],
+      "image": "/slides/retail-banking-growth-demo/4.webp"
+    },
+    {
+      "title": "A segment-led model shifts investment toward households with headroom and intent",
+      "bullets": [
+        "WHERE TO INVEST",
+        "Priority pool",
+        "Emerging affluent and young professionals combine high intent with relationship headroom.",
+        "Use segment economics to set journey investment and service intensity.",
+        ": ",
+        ": ",
+        ": ",
+        ": ",
+        ": "
+      ],
+      "notes": "[Sources]\n- Synthetic demonstration data created for Consulting Deck v0.2. Not a real-world benchmark or forecast.",
+      "narration": "",
+      "keywords": [],
+      "image": "/slides/retail-banking-growth-demo/5.webp"
+    },
+    {
+      "title": "Four moves can add 9–12 points to modeled wallet share",
+      "bullets": [
+        "GROWTH AGENDA",
+        "Detect life events",
+        "2–3 pts",
+        "Personalize next best action",
+        "3–4 pts",
+        "Redesign first 30 days",
+        "Reward relationship depth",
+        "2 pts",
+        "9–12 pts",
+        "modeled wallet-share upside"
+      ],
+      "notes": "[Sources]\n- Synthetic demonstration data created for Consulting Deck v0.2. Not a real-world benchmark or forecast.",
+      "narration": "",
+      "keywords": [],
+      "image": "/slides/retail-banking-growth-demo/6.webp"
+    }
+  ]
+}

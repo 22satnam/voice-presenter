@@ -9,7 +9,7 @@ client = TestClient(app)
 def test_unconfigured_answer_stream_does_not_fabricate(monkeypatch):
     monkeypatch.delenv('GROQ_API_KEY', raising=False)
     monkeypatch.delenv('GEMINI_API_KEY', raising=False)
-    deck = client.get('/api/decks/rag').json()
+    deck = client.get('/api/decks/ai-value-realization-demo').json()
     response = client.post('/api/answer', json={
         'session_id': 'demo', 'question':'Why use embeddings?', 'deck':deck,
         'current_slide':0, 'target_slide':2, 'history':[],
@@ -26,7 +26,7 @@ def test_narration_uses_target_slide_with_stream(monkeypatch):
         yield {'type':'delta','text':'Fresh generated narration.'}
         yield {'type':'usage','usage':{'provider':'stub','input_tokens':12,'output_tokens':4}}
     monkeypatch.setattr(main,'stream',fake_stream)
-    deck = client.get('/api/decks/rag').json()
+    deck = client.get('/api/decks/ai-value-realization-demo').json()
     response = client.post('/api/narrate',json={'session_id':'demo','deck':deck,'slide_index':4})
     assert response.status_code == 200 and 'Fresh generated narration.' in response.text
     assert 'PRESENT SLIDE 5' in observed[0]

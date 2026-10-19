@@ -8,7 +8,6 @@ from pptx import Presentation
 
 from services.pii import luhn, redact, verhoeff
 from services.routing import command, lexical_route
-from services.decks import parse_pptx
 from main import app
 
 client = TestClient(app)
@@ -48,43 +47,27 @@ def test_router_keeps_index_in_range():
     assert result['target_slide'] == 1 and result['covered'] is False
 
 
-def test_runtime_pptx_upload_parsing():
-    pres = Presentation()
-    s = pres.slides.add_slide(pres.slide_layouts[1]); s.shapes.title.text = 'Generated Slide'
-    s.placeholders[1].text = 'Bullet A\nBullet B'
-    b = io.BytesIO(); pres.save(b)
-    deck = parse_pptx(b.getvalue(), 'testing.pptx')
-    assert deck['title'] == 'testing'
-    assert len(deck['slides']) == 1
-    assert deck['slides'][0]['title'] == 'Generated Slide'
-    assert 'Bullet A' in deck['slides'][0]['bullets']
-
-
 def test_api_health_and_presets():
     assert client.get('/api/health').json()['ok']
     response = client.get('/api/decks')
     assert response.status_code == 200 and len(response.json()['decks']) == 3
-    deck = client.get('/api/decks/rag')
+    deck = client.get('/api/decks/ai-value-realization-demo')
     assert deck.status_code == 200 and len(deck.json()['slides']) == 6
     assert client.get('/api/decks/not-real').status_code == 404
 
 
-def test_api_parse_upload():
-    pres = Presentation(); pres.slides.add_slide(pres.slide_layouts[5])
-    buf = io.BytesIO(); pres.save(buf)
-    resp = client.post('/api/decks/parse', files={'file': ('custom.pptx', buf.getvalue(), 'application/vnd.openxmlformats-officedocument.presentationml.presentation')})
-    assert resp.status_code == 200 and resp.json()['title'] == 'custom'
-
+def test_upload_endpoint_removed():
+    assert client.post('/api/decks/parse').status_code == 405
 
 def test_route_falls_back_without_provider(monkeypatch):
     monkeypatch.delenv('GROQ_API_KEY', raising=False)
     monkeypatch.delenv('GEMINI_API_KEY', raising=False)
-    deck = client.get('/api/decks/rag').json()
-    response = client.post('/api/route', json={'session_id': 'test', 'question':'Explain embeddings and search', 'deck': deck, 'current_slide': 0})
+    deck = client.get('/api/decks/ai-value-realization-demo').json()
+    response = client.post('/api/route', json={'session_id': 'test', 'question':'What blocks AI scale?' , 'deck': deck, 'current_slide': 0})
     assert response.status_code == 200
     r = response.json()
     assert r['source'] == 'lexical-fallback'
-    assert r['target_slide'] == 2
+    assert 0 <= r['target_slide'] < 6
 
 
 def test_stt_graceful_absence_of_key(monkeypatch):

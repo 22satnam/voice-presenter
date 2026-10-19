@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).with_name(".env"))
 
-from services.decks import list_decks, parse_pptx, preset, MAX_PPTX
+from services.decks import list_decks, preset
 from services.pii import redact
 from services.providers import complete, stream, ProviderUnavailable, GROQ_URL, _headers, ROUTER_MODEL
 from services.routing import command, lexical_route
@@ -106,16 +106,6 @@ async def decks():
 @app.get('/api/decks/{deck_id}')
 async def get_deck(deck_id: str):
     return preset(deck_id)
-
-
-@app.post('/api/decks/parse')
-async def upload_deck(file: UploadFile = File(...)):
-    if not file.filename or not file.filename.lower().endswith('.pptx'):
-        raise HTTPException(status_code=422, detail='Upload a .pptx file')
-    raw = await file.read(MAX_PPTX + 1)
-    result = parse_pptx(raw, file.filename)
-    await record('upload', 'http', 'POST /api/decks/parse', payload={'source': 'uploaded'})
-    return result
 
 
 @app.post('/api/route')
