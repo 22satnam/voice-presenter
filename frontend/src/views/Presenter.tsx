@@ -65,7 +65,7 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
     transcriptionCtl.current?.abort(); transcriptionCtl.current = null;
     speaker.current.cancel();
     if (interrupted && lastEntry.current) patch(lastEntry.current, { interrupted: true });
-    if (interrupted) {
+    if (interrupted || autoPresent) {
       setResume(slideRef.current); setAutoPresent(false);
       telemetry(session, "interrupt", "client", { reason });
     }
@@ -97,8 +97,6 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
     }
   }
 
-  // Text is added to the transcript only after its audio has finished playing.
-  // This avoids recording unheard completion text after barge-in.
   async function generate(path: "/api/answer" | "/api/narrate", data: unknown, signal: AbortSignal, id: number) {
     const entry = addEntry({ role: "agent", text: "", kind: path === "/api/narrate" ? "narration" : "answer" });
     lastEntry.current = entry;
@@ -122,6 +120,7 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
         if (signal.aborted || run.current !== id) break;
         if (event.type === "delta") {
           setStatus("speaking"); produced += event.text; pending += event.text;
+          patch(entry, { text: produced });
           const parts = segmentSentences(pending);
           pending = parts.remainder;
           parts.sentences.forEach(enqueue);
@@ -183,6 +182,7 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
 
   async function present(start: number) {
     const { id, signal } = task();
+    window.speechSynthesis?.resume();
     if (!voiceOnRef.current) { setError("Unmute audio before starting the presentation."); setAutoPresent(false); return; }
     setAutoPresent(true); setResume(null); setError("");
     for (let i = start; i < deck.slides.length; i++) {
@@ -297,6 +297,7 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
           <div className="ml-auto flex gap-2">
             {resume !== null && !autoPresent && <button className="btn" onClick={() => void present(resume)}><Play size={15}/> Resume slide {resume+1}</button>}
             {!autoPresent && <button className="btn btn-primary" onClick={() => void present(slide)}><Play size={15}/> Present from here</button>}
+            {autoPresent && <button className="btn btn-user" onClick={() => stop("button")}><Hand size={15}/> Stop presentation</button>}
           </div>
         </div>
         <div className="panel relative overflow-hidden">
