@@ -64,6 +64,7 @@ export default function App() {
 
   async function openDeck(id: string) {
     stop();
+    listener.current.close();
     setError('');
     setBusy(true);
     try {
@@ -175,8 +176,10 @@ export default function App() {
 
     speaker.current.unlock();
     setError('');
+    let voiceQuestions = false;
     try {
       await listener.current.open();
+      voiceQuestions = true;
     } catch (err) {
       setMicStatus('Mic off');
       setError('Microphone is unavailable, so voice questions are off. The presentation will still continue.');
@@ -216,7 +219,7 @@ export default function App() {
         const isLast = index === deck.slides.length - 1;
         const questionCheckpoint = (index - start + 1) % 2 === 0 || isLast;
 
-        if (questionCheckpoint && micStatus !== 'Mic off') {
+        if (questionCheckpoint && voiceQuestions) {
           await questionBreak(controller, isLast);
           if (controller.signal.aborted) break;
         }
@@ -238,7 +241,7 @@ export default function App() {
     if (active.current === controller) active.current = null;
     setRunning(false);
     setBusy(false);
-    if (micStatus !== 'Mic off') setMicStatus('Ready');
+    listener.current.close();
   }
 
   async function ask(rawQuestion: string) {
