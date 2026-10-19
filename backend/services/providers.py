@@ -32,9 +32,14 @@ async def gemini_complete(messages, max_tokens=150) -> tuple[str, dict]:
     if not key:
         raise ProviderUnavailable('GEMINI_API_KEY not configured')
     url = f'{GEMINI_URL}/{GEMINI_MODEL}:generateContent'
+    system_text = '\n'.join(m['content'] for m in messages if m['role'] == 'system')
+    turns = [m for m in messages if m['role'] != 'system']
+    payload = {'contents': _gemini_contents(turns),
+               'generationConfig': {'maxOutputTokens': max_tokens, 'temperature': 0.3}}
+    if system_text:
+        payload['systemInstruction'] = {'parts': [{'text': system_text}]}
     async with httpx.AsyncClient(timeout=25) as c:
-        r = await c.post(url, params={'key': key}, json={'contents': _gemini_contents(messages),
-              'generationConfig': {'maxOutputTokens': max_tokens, 'temperature': 0.3}})
+        r = await c.post(url, params={'key': key}, json=payload)
         r.raise_for_status()
         obj = r.json()
     parts = ((obj.get('candidates') or [{}])[0].get('content') or {}).get('parts') or []
@@ -86,8 +91,10 @@ async def stream(messages, model=ANSWER_MODEL, max_tokens=420) -> AsyncIterator[
         yield {'type': 'delta', 'text': value}
         yield {'type': 'usage', 'usage': usage}
         return
-    except (ProviderUnavailable, httpx.HTTPError, ValueError, KeyError, IndexError):
-        pass
+    except (ProviderUnavailable, httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
+        # Safe category only: no request body or credentials in logs.
+        detail = str(exc.response.status_code) if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+        print(f'Gemini failed: {detail}', flush=True)
 
     if not os.getenv('GROQ_API_KEY'):
         yield {'type': 'error', 'message': 'Gemini unavailable and Groq fallback is not configured.'}
