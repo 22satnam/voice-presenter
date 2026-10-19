@@ -8,7 +8,7 @@ import { matchCommand, redactPII } from "@/lib/engine";
 type Mode = "idle" | "listening" | "thinking" | "speaking";
 type Entry = { id: number; role: "user" | "agent" | "system"; text: string; meta?: string; interrupted?: boolean; pii?: string[]; kind?: "narration" | "answer" };
 type Totals = { inTokens: number; outTokens: number; sttSeconds: number; ttsChars: number; local: number; answers: number };
-type VadInstance = { start: () => void; pause: () => void };
+type VadInstance = { start: () => void | Promise<void>; pause: () => void | Promise<void> };
 
 const ZERO: Totals = { inTokens: 0, outTokens: 0, sttSeconds: 0, ttsChars: 0, local: 0, answers: 0 };
 
@@ -221,7 +221,17 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
       r.lang = "en-IN"; r.continuous = true; r.interimResults = false;
       r.onspeechstart = () => { if (modeRef.current === "speaking" || modeRef.current === "thinking") stop("voice"); };
       r.onresult = (e: any) => askRef.current(e.results[e.results.length - 1][0].transcript);
-      r.onerror = () => { setMicLive(false); setError("Browser speech input failed; use typed input."); };
+      r.onerror = (event: any) => {
+        setMicLive(false);
+        const reason = String(event?.error || "unknown");
+        const explanation = reason === "not-allowed" || reason === "service-not-allowed"
+          ? "Microphone access was denied. Allow this site's microphone in browser settings and try again."
+          : reason === "network" ? "The browser's speech recognition service could not connect. Configure GROQ_API_KEY for more reliable transcription."
+          : reason === "audio-capture" ? "No working microphone was found. Check your audio input device and permissions."
+          : reason === "no-speech" ? "No speech detected. Try again and speak closer to your microphone."
+          : `Browser speech recognition failed (${reason}). Use typed input or configure GROQ_API_KEY.`;
+        setError(explanation);
+      };
       r.onend = () => setMicLive(false);
       r.start(); setMicLive(true); setStatus("listening");
       return true;
@@ -234,17 +244,29 @@ export function Presenter({ deck, onExit }: { deck: Deck; onExit: () => void }) 
       setMicLive(false); return;
     }
     setError("");
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError("This browser cannot access microphone devices. Use HTTPS and a supported browser, or type a question.");
+      return;
+    }
     try {
-      if (vad.current) { vad.current.start(); setMicLive(true); setStatus("listening"); return; }
+      if (vad.current) { await vad.current.start(); setMicLive(true); setStatus("listening"); return; }
       const { MicVAD } = await import("@ricky0123/vad-web");
       const instance = await MicVAD.new({
         model: "v5", minSpeechMs: 250, redemptionMs: 550,
+        baseAssetPath: "/vad/", onnxWASMBasePath: "/onnx/",
         onSpeechRealStart: () => { if (modeRef.current === "speaking" || modeRef.current === "thinking") stop("voice"); setStatus("listening"); },
         onSpeechEnd: (audio: Float32Array) => { void onSpeechEnd(audio); },
       });
-      vad.current = instance; instance.start(); setMicLive(true); setStatus("listening");
-    } catch {
-      if (!startBrowserRecognition()) setError("Microphone/VAD unavailable. Please type a question.");
+      await instance.start(); vad.current = instance;
+      setMicLive(true); setStatus("listening");
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      if (/denied|notallowed|permission/i.test(err.name + " " + err.message)) {
+        setError("Microphone permission denied. Use the lock icon in the browser address bar to allow this site's microphone.");
+        return;
+      }
+      if (startBrowserRecognition()) setError("Voice activity detection could not start. Using browser recognition; speak your question. Configure GROQ_API_KEY for reliable transcription.");
+      else setError(`Microphone setup failed: ${err.message}. Try Chrome or Edge, or type your question.`);
     }
   }
 
