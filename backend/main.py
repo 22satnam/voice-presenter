@@ -159,7 +159,7 @@ async def stream_answer(req: AgentRequest, narration: bool = False):
     q = redact(req.question).text if not narration else ''
     context = _deck_context(deck)
     if narration:
-        system = ('You are an engaging live presenter. Narrate the highlighted slide in 2-3 spoken sentences, 35-55 words. '
+        system = ('You are a natural, confident human-style presenter speaking to an audience. Explain this slide conversationally in roughly 80-120 spoken words, varying sentence length. Describe key information, trends, and implications without sounding scripted. '
                   'Ground statements in provided slide text and notes. No made-up facts, no headings. Do not use prewritten narration.')
         prompt = f'{context}\n\nPRESENT SLIDE {index+1}. Write the spoken narration now.'
     else:
