@@ -23,7 +23,7 @@ h1 { font-size: 42px; margin: 0 0 10px; letter-spacing: -.03em; }
 .heading strong { font-size: 22px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .heading small { color: #5e718a; }
 .layout { display: grid; grid-template-columns: minmax(0, 1fr) 350px; gap: 16px; }
-.slide-image { background: #fff; border: 1px solid #d9e1ea; border-radius: 12px; overflow: hidden; }
+.slide-image { position: relative; background: #fff; border: 1px solid #d9e1ea; border-radius: 12px; overflow: hidden; }
 .slide-image img { display: block; width: 100%; aspect-ratio: 16/9; object-fit: contain; }
 .pager { display: flex; align-items: center; justify-content: space-between; margin: 14px 0; }
 .pager span { color: #6a7a91; }
@@ -41,3 +41,26 @@ h1 { font-size: 42px; margin: 0 0 10px; letter-spacing: -.03em; }
 .ask { display: flex; gap: 6px; padding: 12px; border-top: 1px solid #e5eaf0; }
 .ask input { width: 100%; min-width: 0; padding: 10px; border: 1px solid #d9e1ea; border-radius: 8px; }
 @media (max-width: 930px) { .layout { grid-template-columns: 1fr; } .conversation { height: 490px; } .decks { grid-template-columns: 1fr; } .toolbar { flex-wrap: wrap; } .actions { width: 100%; } }
+
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  background: rgba(246, 248, 251, .92);
+  backdrop-filter: blur(3px);
+  text-align: center;
+}
+.loading-overlay strong { font-size: 16px; }
+.loading-overlay small { color: #64748b; }
+.spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid #cbd5e1;
+  border-top-color: #175bd1;
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
