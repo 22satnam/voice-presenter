@@ -105,6 +105,7 @@ export default function App() {
     setRunning(false);
     setBusy(false);
     setLoadingText('');
+    questionPrompt.current = null;
   }
 
   async function openDeck(id: string) {
@@ -186,7 +187,10 @@ export default function App() {
     })();
 
     preparing.current.set(index, request);
-    void request.finally(() => preparing.current.delete(index));
+    void request.then(
+      () => preparing.current.delete(index),
+      () => preparing.current.delete(index),
+    );
     return request;
   }
 
