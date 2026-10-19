@@ -1,6 +1,21 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, speechAudio, transcribeAudio, type Answer, type Deck, type DeckItem } from './api';
-import { Listener, type MicStatus } from './listener';
+import {
+  api,
+  speechAudio,
+  streamAnswer,
+  type Deck,
+  type DeckItem,
+  type PreparedNarration,
+} from './api';
+import {
+  CACHE_VERSION,
+  readPreparedDeck,
+  savePreparedDeck,
+  splitSentences,
+  type CachedDeck,
+  type CachedSlide,
+} from './cache';
+import { RealtimeVoice, type VoiceStatus } from './realtime';
 import { Speaker } from './voice';
 
 type Message = {
@@ -10,20 +25,35 @@ type Message = {
   narration?: boolean;
 };
 
-type PreparedSlide = {
+type PreparedAnswer = {
+  slideIndex: number;
   text: string;
-  provider: string;
-  audio: ArrayBuffer;
-  buffer?: AudioBuffer;
+  sentences: { text: string; audio: Promise<ArrayBuffer | null> }[];
 };
 
-const QUESTION_PROMPT = 'I will pause here for a moment. Any questions before I move on?';
+type Waiter = {
+  promise: Promise<void>;
+  resolve: () => void;
+};
+
+type DraftAnswer = {
+  transcript: string;
+  controller: AbortController;
+  promise: Promise<PreparedAnswer>;
+};
 
 const IGNORED_SPEECH = new Set([
   'thank you', 'thanks', 'thank you very much', 'thanks a lot',
   'okay', 'ok', 'alright', 'yes', 'no', 'great', 'cool', 'got it',
   'hmm', 'um', 'uh',
 ]);
+
+const FILLERS = {
+  goodQuestion: 'Good question — let me pull that up.',
+  letMeShowYou: 'Sure — let me show you the relevant slide.',
+  anyQuestions: 'I will pause here for a moment. Any questions before I move on?',
+  finalQuestions: 'That brings us to the end of the presentation. Any questions?',
+};
 
 function cleanSpeech(text: string) {
   return text.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
@@ -35,11 +65,45 @@ function looksLikeEcho(question: string, spokenText: string) {
   if (!questionText || !sourceText) return false;
   if (questionText.length >= 14 && sourceText.includes(questionText)) return true;
 
-  const questionWords = [...new Set(questionText.split(' ').filter(word => word.length > 2))];
-  if (questionWords.length < 3) return false;
+  const words = [...new Set(questionText.split(' ').filter(word => word.length > 2))];
+  if (words.length < 3) return false;
   const sourceWords = new Set(sourceText.split(' '));
-  const overlap = questionWords.filter(word => sourceWords.has(word)).length;
-  return overlap / questionWords.length >= 0.72;
+  const overlap = words.filter(word => sourceWords.has(word)).length;
+  return overlap / words.length >= 0.72;
+}
+
+function completeSentences(buffer: string) {
+  const sentences: string[] = [];
+  let rest = buffer;
+  while (true) {
+    const match = rest.match(/^([\s\S]*?[.!?])(?:\s+|$)/);
+    if (!match) break;
+    const sentence = match[1].trim();
+    if (sentence) sentences.push(sentence);
+    rest = rest.slice(match[0].length);
+  }
+  return { sentences, rest };
+}
+
+async function runPool<T>(
+  jobs: (() => Promise<T>)[],
+  concurrency: number,
+  onDone: () => void,
+): Promise<T[]> {
+  const results = new Array<T>(jobs.length);
+  let cursor = 0;
+
+  async function worker() {
+    while (true) {
+      const index = cursor++;
+      if (index >= jobs.length) return;
+      results[index] = await jobs[index]();
+      onDone();
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
+  return results;
 }
 
 export default function App() {
@@ -52,88 +116,64 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [error, setError] = useState('');
   const [voice, setVoice] = useState('');
-  const [micStatus, setMicStatus] = useState<MicStatus>('Mic off');
+  const [micStatus, setMicStatus] = useState<VoiceStatus>('Mic off');
   const [loadingText, setLoadingText] = useState('');
+  const [deckReady, setDeckReady] = useState(false);
+  const [prepProgress, setPrepProgress] = useState({ done: 0, total: 0 });
 
   const active = useRef<AbortController | null>(null);
-  const prefetchController = useRef<AbortController | null>(null);
+  const preparation = useRef<AbortController | null>(null);
   const current = useRef(0);
   const messagesRef = useRef<Message[]>([]);
-  const lastTranscript = useRef({ text: '', at: 0 });
-  const voiceEnabled = useRef(false);
+  const preparedDeck = useRef<CachedDeck | null>(null);
+  const decoded = useRef(new Map<string, AudioBuffer>());
   const speaker = useRef(new Speaker());
-  const listener = useRef(new Listener(setMicStatus));
-  const prepared = useRef(new Map<number, PreparedSlide>());
-  const preparing = useRef(new Map<number, Promise<PreparedSlide>>());
-  const questionPrompt = useRef<Promise<AudioBuffer> | null>(null);
+  const realtime = useRef<RealtimeVoice | null>(null);
+  const currentSentence = useRef<{ slideIndex: number; text: string } | null>(null);
+  const interrupt = useRef<Waiter | null>(null);
+  const checkpoint = useRef<Waiter | null>(null);
+  const speculative = useRef<DraftAnswer | null>(null);
+  const presentationActive = useRef(false);
+  const handlingQuestion = useRef(false);
+  const lastTranscript = useRef({ text: '', at: 0 });
+  const fillerCounter = useRef(0);
+
+  const onSpeechStartRef = useRef(() => {});
+  const onSpeechConfirmedRef = useRef(() => {});
+  const onSpeechMisfireRef = useRef(() => {});
+  const onEagerRef = useRef((_text: string) => {});
+  const onTurnResumedRef = useRef(() => {});
+  const onFinalRef = useRef((_text: string) => {});
 
   useEffect(() => {
     api<DeckItem[]>('/api/decks').then(setDecks).catch(err => setError(err.message));
     return () => {
       active.current?.abort();
-      prefetchController.current?.abort();
+      preparation.current?.abort();
+      speculative.current?.controller.abort();
       speaker.current.stop();
-      listener.current.close();
+      realtime.current?.stop();
     };
   }, []);
 
-  useEffect(() => {
-    if (!deck) return;
-
-    prefetchController.current?.abort();
-    prefetchController.current = new AbortController();
-    prepared.current.clear();
-    preparing.current.clear();
-    questionPrompt.current = null;
-
-    // Hide most of the first-slide delay before the user presses Present.
-    void ensurePrepared(0).catch(() => {});
-    return () => prefetchController.current?.abort();
-  }, [deck?.id]);
+  function getRealtime() {
+    if (!realtime.current) {
+      realtime.current = new RealtimeVoice({
+        onStatus: setMicStatus,
+        onSpeechStart: () => onSpeechStartRef.current(),
+        onSpeechConfirmed: () => onSpeechConfirmedRef.current(),
+        onSpeechMisfire: () => onSpeechMisfireRef.current(),
+        onEagerEnd: text => onEagerRef.current(text),
+        onTurnResumed: () => onTurnResumedRef.current(),
+        onFinal: text => onFinalRef.current(text),
+      });
+    }
+    return realtime.current;
+  }
 
   function addMessage(message: Message) {
     messagesRef.current = [...messagesRef.current, message];
     setMessages(messagesRef.current);
-  }
-
-  function stop() {
-    active.current?.abort();
-    active.current = null;
-    speaker.current.stop();
-    listener.current.close();
-    voiceEnabled.current = false;
-    setRunning(false);
-    setBusy(false);
-    setLoadingText('');
-    questionPrompt.current = null;
-  }
-
-  async function openDeck(id: string) {
-    stop();
-    setError('');
-    setBusy(true);
-    try {
-      const picked = await api<Deck>('/api/decks/' + id);
-      setDeck(picked);
-      setSlide(0);
-      current.current = 0;
-      messagesRef.current = [];
-      setMessages([]);
-      setVoice('');
-      setMicStatus('Mic off');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not load presentation');
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function selectSlide(index: number) {
-    stop();
-    const next = Math.max(0, Math.min(index, (deck?.slides.length || 1) - 1));
-    current.current = next;
-    setSlide(next);
-    void ensurePrepared(next).catch(() => {});
   }
 
   function recentHistory() {
@@ -146,203 +186,446 @@ export default function App() {
       }));
   }
 
-  function usableTranscript(text: string, spokenText = '') {
+  function ensureInterruptWaiter() {
+    if (interrupt.current) return interrupt.current;
+    let resolve!: () => void;
+    const promise = new Promise<void>(done => { resolve = done; });
+    interrupt.current = { promise, resolve };
+    return interrupt.current;
+  }
+
+  function resolveInterrupt() {
+    interrupt.current?.resolve();
+    interrupt.current = null;
+    speaker.current.restore();
+  }
+
+  function ensureCheckpointWaiter() {
+    if (checkpoint.current) return checkpoint.current;
+    let resolve!: () => void;
+    const promise = new Promise<void>(done => { resolve = done; });
+    checkpoint.current = { promise, resolve };
+    return checkpoint.current;
+  }
+
+  function resolveCheckpoint() {
+    checkpoint.current?.resolve();
+    checkpoint.current = null;
+  }
+
+  function stop() {
+    active.current?.abort();
+    active.current = null;
+    speculative.current?.controller.abort();
+    speculative.current = null;
+    speaker.current.stop();
+    realtime.current?.stop();
+    presentationActive.current = false;
+    handlingQuestion.current = false;
+    currentSentence.current = null;
+    resolveInterrupt();
+    resolveCheckpoint();
+    setRunning(false);
+    setBusy(false);
+    setLoadingText('');
+  }
+
+  async function audioWithRetry(text: string, signal: AbortSignal) {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await speechAudio(text, signal);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        lastError = error;
+        await new Promise(resolve => window.setTimeout(resolve, 650 * (attempt + 1)));
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('Voice generation failed');
+  }
+
+  async function prepareSelectedDeck(picked: Deck, signal: AbortSignal) {
+    setDeckReady(false);
+    setPrepProgress({ done: 0, total: 0 });
+    setLoadingText('Checking prepared presentation…');
+
+    const cached = await readPreparedDeck(picked.id).catch(() => null);
+    if (cached && !signal.aborted) {
+      preparedDeck.current = cached;
+      setDeckReady(true);
+      setLoadingText('');
+      return;
+    }
+
+    setLoadingText('Writing narration for the full presentation…');
+    const narration = await api<PreparedNarration>(
+      '/api/prepare-deck',
+      { deck_id: picked.id },
+      signal,
+    );
+    if (signal.aborted) return;
+
+    const slideSentences = narration.slides.map(item => splitSentences(item.text));
+    const jobs: {
+      slideIndex: number;
+      sentenceIndex: number;
+      text: string;
+      run: () => Promise<ArrayBuffer>;
+    }[] = [];
+
+    slideSentences.forEach((sentences, slideIndex) => {
+      sentences.forEach((text, sentenceIndex) => {
+        jobs.push({
+          slideIndex,
+          sentenceIndex,
+          text,
+          run: () => audioWithRetry(text, signal),
+        });
+      });
+    });
+
+    const fillerEntries = Object.entries(FILLERS) as [keyof CachedDeck['fillers'], string][];
+    const total = jobs.length + fillerEntries.length;
+    let done = 0;
+    setPrepProgress({ done, total });
+    setLoadingText('Generating natural voice for the presentation…');
+
+    const audio = await runPool(
+      jobs.map(job => job.run),
+      4,
+      () => {
+        done += 1;
+        setPrepProgress({ done, total });
+      },
+    );
+
+    const fillerAudio = await runPool(
+      fillerEntries.map(([, text]) => () => audioWithRetry(text, signal)),
+      3,
+      () => {
+        done += 1;
+        setPrepProgress({ done, total });
+      },
+    );
+
+    if (signal.aborted) return;
+
+    const slides: CachedSlide[] = narration.slides.map((item, slideIndex) => ({
+      text: item.text,
+      sentences: slideSentences[slideIndex].map((text, sentenceIndex) => {
+        const jobIndex = jobs.findIndex(
+          job => job.slideIndex === slideIndex && job.sentenceIndex === sentenceIndex,
+        );
+        return { text, audio: audio[jobIndex] };
+      }),
+    }));
+
+    const fillers = Object.fromEntries(
+      fillerEntries.map(([key], index) => [key, fillerAudio[index]]),
+    ) as CachedDeck['fillers'];
+
+    const prepared: CachedDeck = {
+      cacheVersion: CACHE_VERSION,
+      deckId: picked.id,
+      slides,
+      fillers,
+    };
+
+    preparedDeck.current = prepared;
+    await savePreparedDeck(prepared).catch(() => {});
+    setDeckReady(true);
+    setLoadingText('');
+  }
+
+  async function openDeck(id: string) {
+    stop();
+    preparation.current?.abort();
+    const controller = new AbortController();
+    preparation.current = controller;
+    setError('');
+    setBusy(true);
+    setDeckReady(false);
+    preparedDeck.current = null;
+    decoded.current.clear();
+
+    try {
+      const picked = await api<Deck>('/api/decks/' + id, undefined, controller.signal);
+      if (controller.signal.aborted) return;
+      setDeck(picked);
+      setSlide(0);
+      current.current = 0;
+      messagesRef.current = [];
+      setMessages([]);
+      setVoice('');
+      setBusy(false);
+      await prepareSelectedDeck(picked, controller.signal);
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        setError(err instanceof Error ? err.message : 'Could not prepare presentation');
+        setLoadingText('');
+        setBusy(false);
+      }
+    }
+  }
+
+  function selectSlide(index: number) {
+    if (!deck || running) return;
+    const next = Math.max(0, Math.min(index, deck.slides.length - 1));
+    current.current = next;
+    setSlide(next);
+  }
+
+  async function decodedSentence(slideIndex: number, sentenceIndex: number) {
+    const key = slideIndex + ':' + sentenceIndex;
+    const cached = decoded.current.get(key);
+    if (cached) return cached;
+
+    const sentence = preparedDeck.current?.slides[slideIndex]?.sentences[sentenceIndex];
+    if (!sentence) throw new Error('Prepared narration is missing');
+    const buffer = await speaker.current.decode(sentence.audio);
+    decoded.current.set(key, buffer);
+    return buffer;
+  }
+
+  async function fillerBuffer(name: keyof CachedDeck['fillers']) {
+    const key = 'filler:' + name;
+    const cached = decoded.current.get(key);
+    if (cached) return cached;
+    const audio = preparedDeck.current?.fillers[name];
+    if (!audio) throw new Error('Prepared filler audio is missing');
+    const buffer = await speaker.current.decode(audio);
+    decoded.current.set(key, buffer);
+    return buffer;
+  }
+
+  function transcriptAllowed(text: string, spokenText = '', commit = true) {
     const cleaned = cleanSpeech(text);
     if (!cleaned || IGNORED_SPEECH.has(cleaned)) return '';
     if (spokenText && looksLikeEcho(text, spokenText)) return '';
 
-    const now = Date.now();
-    if (cleaned === lastTranscript.current.text && now - lastTranscript.current.at < 10000) return '';
-    lastTranscript.current = { text: cleaned, at: now };
+    if (commit) {
+      const now = Date.now();
+      if (cleaned === lastTranscript.current.text && now - lastTranscript.current.at < 10000) {
+        return '';
+      }
+      lastTranscript.current = { text: cleaned, at: now };
+    }
+
     return text.trim();
   }
 
-  async function transcribeQuestion(audio: Blob, signal: AbortSignal, spokenText = '') {
-    const text = await transcribeAudio(audio, signal);
-    return usableTranscript(text, spokenText);
-  }
-
-  function ensurePrepared(index: number): Promise<PreparedSlide> {
-    if (!deck || index < 0 || index >= deck.slides.length) {
-      return Promise.reject(new Error('Invalid slide'));
-    }
-
-    const cached = prepared.current.get(index);
-    if (cached) return Promise.resolve(cached);
-
-    const pending = preparing.current.get(index);
-    if (pending) return pending;
-
-    prefetchController.current ||= new AbortController();
-    const signal = prefetchController.current.signal;
-    const request = (async () => {
-      const narration = await api<{ text: string; provider: string }>('/api/narrate', {
-        deck_id: deck.id,
-        slide_index: index,
-      }, signal);
-      const audio = await speechAudio(narration.text, signal);
-      const value: PreparedSlide = { ...narration, audio };
-      prepared.current.set(index, value);
-      return value;
-    })();
-
-    preparing.current.set(index, request);
-    void request.then(
-      () => preparing.current.delete(index),
-      () => preparing.current.delete(index),
-    );
-    return request;
-  }
-
-  async function preparedForPlayback(index: number) {
-    const cached = prepared.current.get(index);
-    if (cached) return cached;
-
-    setLoadingText('Preparing slide ' + (index + 1) + ' narration…');
-    try {
-      return await ensurePrepared(index);
-    } finally {
-      setLoadingText('');
-    }
-  }
-
-  function warmNext(index: number) {
-    for (const next of [index + 1, index + 2]) {
-      if (deck && next < deck.slides.length) void ensurePrepared(next).catch(() => {});
-    }
-
-    // Keep memory bounded: current slide, one behind, and two ahead.
-    for (const key of prepared.current.keys()) {
-      if (key < index - 1 || key > index + 2) prepared.current.delete(key);
-    }
-  }
-
-  async function decodeSlide(item: PreparedSlide) {
-    item.buffer ||= await speaker.current.decode(item.audio);
-    return item.buffer;
-  }
-
-  async function getQuestionPrompt(signal: AbortSignal) {
-    questionPrompt.current ||= speaker.current.prepare(QUESTION_PROMPT, signal);
-    return questionPrompt.current;
-  }
-
-  async function answerQuestion(text: string, controller: AbortController, depth = 0) {
-    if (!deck || !text || controller.signal.aborted) return;
-
-    const history = recentHistory();
-    addMessage({ role: 'You', text });
-    setBusy(true);
-    setLoadingText('Finding the relevant slide…');
-
-    const reply = await api<Answer>('/api/ask', {
-      deck_id: deck.id,
-      current_slide: current.current,
-      question: text,
-      history,
-    }, controller.signal);
-
-    if (controller.signal.aborted) return;
-
-    // The user sees the referenced slide before the answer starts.
-    current.current = reply.slide_index;
-    setSlide(reply.slide_index);
-    addMessage({ role: 'Presenter', text: reply.answer, slide: reply.slide_number });
-
-    setLoadingText('Preparing the answer…');
-    const answerBuffer = await speaker.current.prepare(reply.answer, controller.signal);
-    setLoadingText('');
-    setBusy(false);
-
-    if (voiceEnabled.current && depth < 2) {
-      await playWithBargeIn(answerBuffer, reply.answer, reply.slide_index, controller, depth + 1);
-    } else {
-      await speaker.current.play(answerBuffer, controller.signal, 0, setVoice);
-    }
-  }
-
-  async function playWithBargeIn(
-    buffer: AudioBuffer,
-    spokenText: string,
-    originSlide: number,
+  async function buildStreamAnswer(
+    text: string,
     controller: AbortController,
-    depth = 0,
-  ) {
-    let offset = 0;
+    onSlide?: (index: number) => void,
+  ): Promise<PreparedAnswer> {
+    if (!deck) throw new Error('No presentation selected');
 
-    while (!controller.signal.aborted && offset < buffer.duration - 0.03) {
-      if (!voiceEnabled.current) {
-        await speaker.current.play(buffer, controller.signal, offset, setVoice);
-        return;
-      }
+    let slideIndex = current.current;
+    let fullText = '';
+    let pending = '';
+    const sentences: PreparedAnswer['sentences'] = [];
 
-      const listenController = new AbortController();
-      const cancelListener = () => listenController.abort();
-      controller.signal.addEventListener('abort', cancelListener, { once: true });
-
-      const listenPromise = listener.current.listen(listenController.signal, {
-        mode: 'barge',
-        timeoutMs: Math.ceil((buffer.duration - offset + 2) * 1000),
-        onSpeechStart: () => { speaker.current.pause(); },
+    const queueSentence = (sentence: string) => {
+      const clean = sentence.trim();
+      if (!clean) return;
+      sentences.push({
+        text: clean,
+        audio: audioWithRetry(clean, controller.signal).catch(() => null),
       });
+    };
 
-      let playback;
-      try {
-        playback = await speaker.current.play(buffer, controller.signal, offset, setVoice);
-      } finally {
-        controller.signal.removeEventListener('abort', cancelListener);
-      }
+    await streamAnswer(
+      {
+        deck_id: deck.id,
+        current_slide: current.current,
+        question: text,
+        history: recentHistory(),
+      },
+      controller.signal,
+      {
+        onSlide: index => {
+          slideIndex = index;
+          onSlide?.(index);
+        },
+        onText: chunk => {
+          fullText += chunk;
+          pending += chunk;
+          const parsed = completeSentences(pending);
+          pending = parsed.rest;
+          parsed.sentences.forEach(queueSentence);
+        },
+      },
+    );
 
-      if (playback.completed) {
-        listenController.abort();
-        await listenPromise.catch(() => null);
-        return;
-      }
+    if (pending.trim()) queueSentence(pending.trim());
+    if (!fullText.trim()) throw new Error('Gemini returned an empty answer');
 
-      const audio = await listenPromise;
-      offset = playback.offset;
-      if (!audio || controller.signal.aborted) continue;
+    return { slideIndex, text: fullText.trim(), sentences };
+  }
 
-      setLoadingText('Listening…');
-      const question = await transcribeQuestion(audio, controller.signal, spokenText);
-      setLoadingText('');
+  function startSpeculativeAnswer(transcript: string) {
+    if (!presentationActive.current || handlingQuestion.current) return;
+    const spoken = currentSentence.current?.text || '';
+    const clean = transcriptAllowed(transcript, spoken, false);
+    if (!clean) return;
 
-      if (!question) continue;
+    speculative.current?.controller.abort();
+    const controller = new AbortController();
+    active.current?.signal.addEventListener('abort', () => controller.abort(), { once: true });
+    speculative.current = {
+      transcript: cleanSpeech(clean),
+      controller,
+      promise: buildStreamAnswer(clean, controller),
+    };
+  }
 
-      await answerQuestion(question, controller, depth);
+  function cancelSpeculativeAnswer() {
+    speculative.current?.controller.abort();
+    speculative.current = null;
+  }
 
-      // Return to the interrupted slide and continue from the exact audio offset.
-      current.current = originSlide;
-      setSlide(originSlide);
+  async function playPreparedAnswer(answer: PreparedAnswer, signal: AbortSignal) {
+    setSlide(answer.slideIndex);
+    current.current = answer.slideIndex;
+    addMessage({ role: 'Presenter', text: answer.text, slide: answer.slideIndex + 1 });
+
+    for (const sentence of answer.sentences) {
+      if (signal.aborted) return;
+      let audio = await sentence.audio;
+      if (!audio) audio = await audioWithRetry(sentence.text, signal);
+      const buffer = await speaker.current.decode(audio);
+      await speaker.current.play(buffer, signal, setVoice);
     }
   }
 
-  async function questionBreak(controller: AbortController, isLastSlide: boolean) {
-    if (!voiceEnabled.current || controller.signal.aborted) return;
+  async function handleVoiceQuestion(rawTranscript: string) {
+    if (!deck || handlingQuestion.current) return;
+
+    const origin = currentSentence.current?.slideIndex ?? current.current;
+    const spoken = currentSentence.current?.text || '';
+    const transcript = transcriptAllowed(rawTranscript, spoken, true);
+
+    if (!transcript) {
+      cancelSpeculativeAnswer();
+      speaker.current.restore();
+      resolveInterrupt();
+      resolveCheckpoint();
+      return;
+    }
+
+    handlingQuestion.current = true;
+    setLoadingText('Understanding your question…');
+    addMessage({ role: 'You', text: transcript });
+
+    const parentSignal = active.current?.signal;
+    const normalized = cleanSpeech(transcript);
+    let answerPromise: Promise<PreparedAnswer>;
+
+    if (speculative.current?.transcript === normalized && !speculative.current.controller.signal.aborted) {
+      answerPromise = speculative.current.promise;
+    } else {
+      cancelSpeculativeAnswer();
+      const controller = new AbortController();
+      parentSignal?.addEventListener('abort', () => controller.abort(), { once: true });
+      speculative.current = {
+        transcript: normalized,
+        controller,
+        promise: buildStreamAnswer(transcript, controller),
+      };
+      answerPromise = speculative.current.promise;
+    }
 
     try {
-      const prompt = await getQuestionPrompt(controller.signal);
-      await speaker.current.play(prompt, controller.signal, 0, setVoice);
+      const fillerName = fillerCounter.current++ % 2 === 0 ? 'goodQuestion' : 'letMeShowYou';
+      const filler = await fillerBuffer(fillerName);
+      const fillerController = active.current;
+      if (fillerController && !fillerController.signal.aborted) {
+        await speaker.current.play(filler, fillerController.signal, setVoice);
+      }
+
+      setLoadingText('Finding the relevant slide…');
+      const answer = await answerPromise;
+      if (active.current?.signal.aborted) return;
+
+      setSlide(answer.slideIndex);
+      current.current = answer.slideIndex;
+      setLoadingText('');
+      await playPreparedAnswer(answer, active.current!.signal);
+
+      if (presentationActive.current && !active.current?.signal.aborted) {
+        current.current = origin;
+        setSlide(origin);
+      }
     } catch (err) {
-      if (controller.signal.aborted) return;
+      if (!active.current?.signal.aborted) {
+        setError(err instanceof Error ? err.message : 'Could not answer that question');
+      }
+    } finally {
+      cancelSpeculativeAnswer();
+      handlingQuestion.current = false;
+      setLoadingText('');
+      resolveInterrupt();
+      resolveCheckpoint();
     }
+  }
+
+  onSpeechStartRef.current = () => {
+    if (!presentationActive.current || handlingQuestion.current) return;
+    if (currentSentence.current) speaker.current.duck();
+  };
+
+  onSpeechConfirmedRef.current = () => {
+    if (!presentationActive.current || handlingQuestion.current) return;
+    if (!currentSentence.current) return;
+    ensureInterruptWaiter();
+    speaker.current.interrupt();
+    setLoadingText('Listening…');
+  };
+
+  onSpeechMisfireRef.current = () => {
+    if (!handlingQuestion.current) speaker.current.restore();
+  };
+
+  onEagerRef.current = transcript => {
+    if (!interrupt.current || handlingQuestion.current) return;
+    startSpeculativeAnswer(transcript);
+  };
+
+  onTurnResumedRef.current = () => {
+    cancelSpeculativeAnswer();
+    setLoadingText('Listening…');
+  };
+
+  onFinalRef.current = transcript => {
+    if (handlingQuestion.current) return;
+    if (!interrupt.current && currentSentence.current) {
+      ensureInterruptWaiter();
+      speaker.current.interrupt();
+    }
+    void handleVoiceQuestion(transcript);
+  };
+
+  async function askCheckpoint(controller: AbortController, isLast: boolean) {
+    if (controller.signal.aborted || handlingQuestion.current) return;
+
+    const name = isLast ? 'finalQuestions' : 'anyQuestions';
+    const prompt = await fillerBuffer(name);
+    currentSentence.current = null;
+    await speaker.current.play(prompt, controller.signal, setVoice);
 
     if (controller.signal.aborted) return;
 
-    const audio = await listener.current.listen(controller.signal, {
-      mode: 'question',
-      timeoutMs: isLastSlide ? 6500 : 4000,
-    });
-    if (!audio || controller.signal.aborted) return;
-
-    setLoadingText('Listening…');
-    const text = await transcribeQuestion(audio, controller.signal);
-    setLoadingText('');
-    if (text) await answerQuestion(text, controller);
+    const waiter = ensureCheckpointWaiter();
+    await Promise.race([
+      waiter.promise,
+      new Promise<void>(resolve => window.setTimeout(resolve, isLast ? 6500 : 4000)),
+    ]);
+    resolveCheckpoint();
   }
 
   async function present() {
-    if (!deck || running) return;
+    if (!deck || !preparedDeck.current || !deckReady || running) return;
 
     speaker.current.unlock();
     setError('');
@@ -351,61 +634,59 @@ export default function App() {
 
     const controller = new AbortController();
     active.current = controller;
-
-    const micReady = listener.current.open()
-      .then(() => { voiceEnabled.current = true; })
-      .catch(() => {
-        voiceEnabled.current = false;
-        setMicStatus('Mic off');
-        setError('Microphone is unavailable. The presentation will continue without voice interruptions.');
-      });
-
-    // Prepare the Q&A prompt in the background; it will be reused.
-    void getQuestionPrompt(controller.signal).catch(() => { questionPrompt.current = null; });
+    presentationActive.current = true;
 
     try {
-      const start = current.current;
-      const firstSlide = preparedForPlayback(start);
-      await Promise.all([micReady, firstSlide.then(() => undefined)]);
+      const voice = getRealtime();
+      await voice.start().catch(() => {
+        setError('Realtime microphone could not start. The presentation will continue without interruptions.');
+      });
+
       setLoadingText('');
+      const start = current.current;
 
-      for (let index = start; index < deck.slides.length; index++) {
+      for (let slideIndex = start; slideIndex < preparedDeck.current.slides.length; slideIndex++) {
         if (controller.signal.aborted) break;
 
-        current.current = index;
-        setSlide(index);
-        setBusy(true);
+        current.current = slideIndex;
+        setSlide(slideIndex);
 
-        const item = await preparedForPlayback(index);
-        if (controller.signal.aborted) break;
-
-        const buffer = await decodeSlide(item);
+        const preparedSlide = preparedDeck.current.slides[slideIndex];
         addMessage({
           role: 'Presenter',
-          text: item.text,
-          slide: index + 1,
+          text: preparedSlide.text,
+          slide: slideIndex + 1,
           narration: true,
         });
-        setBusy(false);
 
-        // While this slide is speaking, generate narration + voice for the next two.
-        warmNext(index);
-
-        await playWithBargeIn(buffer, item.text, index, controller);
-        if (controller.signal.aborted) break;
-
-        const isLast = index === deck.slides.length - 1;
-        const questionCheckpoint = (index - start + 1) % 2 === 0 || isLast;
-        if (questionCheckpoint) {
-          await questionBreak(controller, isLast);
+        for (let sentenceIndex = 0; sentenceIndex < preparedSlide.sentences.length;) {
           if (controller.signal.aborted) break;
-          current.current = index;
-          setSlide(index);
+
+          const sentence = preparedSlide.sentences[sentenceIndex];
+          currentSentence.current = { slideIndex, text: sentence.text };
+          const buffer = await decodedSentence(slideIndex, sentenceIndex);
+          const result = await speaker.current.play(buffer, controller.signal, setVoice);
+
+          if (result === 'done') {
+            currentSentence.current = null;
+            sentenceIndex += 1;
+          } else {
+            const waiter = interrupt.current;
+            if (waiter) await waiter.promise;
+            currentSentence.current = null;
+            // Restart the interrupted sentence from its beginning.
+          }
         }
 
-        if (!isLast) {
-          current.current = index + 1;
-          setSlide(index + 1);
+        if (controller.signal.aborted) break;
+
+        const isLast = slideIndex === preparedDeck.current.slides.length - 1;
+        const checkpointDue = ((slideIndex - start + 1) % 2 === 0) || isLast;
+        if (checkpointDue) await askCheckpoint(controller, isLast);
+
+        if (!isLast && !controller.signal.aborted) {
+          current.current = slideIndex + 1;
+          setSlide(slideIndex + 1);
         }
       }
     } catch (err) {
@@ -414,9 +695,11 @@ export default function App() {
       }
     } finally {
       if (active.current === controller) active.current = null;
+      presentationActive.current = false;
+      currentSentence.current = null;
+      cancelSpeculativeAnswer();
+      realtime.current?.stop();
       speaker.current.stop();
-      listener.current.close();
-      voiceEnabled.current = false;
       setRunning(false);
       setBusy(false);
       setLoadingText('');
@@ -427,17 +710,23 @@ export default function App() {
     const text = rawQuestion.trim();
     if (!deck || !text || running) return;
 
-    stop();
     speaker.current.unlock();
     setQuestion('');
     setError('');
+    setRunning(true);
+    setLoadingText('Finding the relevant slide…');
 
     const controller = new AbortController();
     active.current = controller;
-    setRunning(true);
 
     try {
-      await answerQuestion(text, controller);
+      addMessage({ role: 'You', text });
+      const answer = await buildStreamAnswer(text, controller, index => {
+        current.current = index;
+        setSlide(index);
+      });
+      setLoadingText('');
+      await playPreparedAnswer(answer, controller.signal);
     } catch (err) {
       if (!controller.signal.aborted) {
         setError(err instanceof Error ? err.message : 'Unable to answer');
@@ -445,47 +734,18 @@ export default function App() {
     } finally {
       if (active.current === controller) active.current = null;
       setRunning(false);
-      setBusy(false);
       setLoadingText('');
     }
   }
 
-  async function askByVoice() {
-    if (!deck || running) return;
-
-    const controller = new AbortController();
-    active.current = controller;
-    setError('');
-
-    try {
-      await listener.current.open();
-      voiceEnabled.current = true;
-      const audio = await listener.current.listen(controller.signal, {
-        mode: 'question',
-        timeoutMs: 8000,
-      });
-      if (!audio || controller.signal.aborted) return;
-
-      const text = await transcribeQuestion(audio, controller.signal);
-      if (text) await answerQuestion(text, controller);
-    } catch (err) {
-      if (!controller.signal.aborted) {
-        setError(err instanceof Error ? err.message : 'Could not use the microphone');
-      }
-    } finally {
-      if (active.current === controller) active.current = null;
-      listener.current.close();
-      voiceEnabled.current = false;
-      setRunning(false);
-      setBusy(false);
-      setLoadingText('');
-    }
-  }
+  const prepPercent = prepProgress.total
+    ? Math.round((prepProgress.done / prepProgress.total) * 100)
+    : 0;
 
   if (!deck) return (
     <main className="home">
       <h1>Voice Presenter</h1>
-      <p>Choose a presentation. Slides are prepared ahead so the presentation can keep moving.</p>
+      <p>Choose a presentation. Narration and voice are prepared once, then reused for seamless playback.</p>
       {error && <p role="alert" className="error">{error}</p>}
       <div className="decks">
         {decks.map(item => (
@@ -503,14 +763,20 @@ export default function App() {
   return (
     <main className="presenter">
       <header className="toolbar">
-        <button onClick={() => { stop(); setDeck(null); }}>← Back</button>
+        <button onClick={() => { stop(); preparation.current?.abort(); setDeck(null); }}>← Back</button>
         <div className="heading">
           <strong>{deck.title}</strong>
-          <small>Slide {slide + 1} of {deck.slides.length}{voice ? ' · ' + voice : ''} · {micStatus}</small>
+          <small>
+            Slide {slide + 1} of {deck.slides.length}
+            {voice ? ' · ' + voice : ''}
+            {running ? ' · ' + micStatus : ''}
+          </small>
         </div>
         <div className="actions">
           {!running
-            ? <button className="primary" onClick={() => void present()}>▶ Present from here</button>
+            ? <button className="primary" disabled={!deckReady} onClick={() => void present()}>
+                ▶ {deckReady ? 'Present from here' : 'Preparing presentation…'}
+              </button>
             : <button className="stop" onClick={stop}>■ Stop presentation</button>}
         </div>
       </header>
@@ -523,7 +789,9 @@ export default function App() {
               <div className="loading-overlay" role="status" aria-live="polite">
                 <span className="spinner" />
                 <strong>{loadingText}</strong>
-                <small>Gemini is preparing the presenter.</small>
+                {!deckReady && prepProgress.total > 0
+                  ? <small>{prepProgress.done} / {prepProgress.total} voice segments · {prepPercent}%</small>
+                  : <small>Please wait a moment.</small>}
               </div>
             )}
           </div>
@@ -552,14 +820,19 @@ export default function App() {
         <aside className="conversation">
           <h2>Conversation</h2>
           <div className="messages" aria-live="polite">
-            {messages.length === 0 && <p className="muted">Click Present from here to start.</p>}
+            {messages.length === 0 && (
+              <p className="muted">
+                {deckReady
+                  ? 'Ready. Click Present from here.'
+                  : 'Preparing narration and voice. This is cached for later sessions.'}
+              </p>
+            )}
             {messages.map((message, index) => (
               <div key={index} className="message">
                 <small>{message.role}{message.slide ? ' · Slide ' + message.slide : ''}</small>
                 <p>{message.text}</p>
               </div>
             ))}
-            {busy && <p className="muted">{loadingText || 'Working…'}</p>}
           </div>
 
           {error && <p role="alert" className="error">{error}</p>}
@@ -572,8 +845,7 @@ export default function App() {
               aria-label="Ask a question"
               disabled={running}
             />
-            <button type="submit" disabled={!question.trim() || busy || running}>Ask</button>
-            <button type="button" onClick={() => void askByVoice()} disabled={running} title="Ask by voice">🎙 Ask</button>
+            <button type="submit" disabled={!question.trim() || running}>Ask</button>
           </form>
         </aside>
       </section>
