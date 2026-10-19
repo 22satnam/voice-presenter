@@ -1,7 +1,13 @@
+import { DeepgramClient } from '@deepgram/sdk';
 import { MicVAD } from '@ricky0123/vad-web';
 import { deepgramToken, transcribeAudio } from './api';
 
-export type VoiceStatus = 'Mic off' | 'Connecting' | 'Ready' | 'User speaking' | 'Transcribing';
+export type VoiceStatus =
+  | 'Mic off'
+  | 'Ready'
+  | 'User speaking'
+  | 'Flux'
+  | 'Transcribing';
 
 export type VoiceCallbacks = {
   onStatus: (status: VoiceStatus) => void;
@@ -13,30 +19,22 @@ export type VoiceCallbacks = {
   onFinal: (transcript: string) => void;
 };
 
-type TurnInfo = {
-  type?: string;
-  event?: string;
-  transcript?: string;
-};
+type FluxConnection = Awaited<ReturnType<DeepgramClient['listen']['v2']['connect']>>;
 
 export class RealtimeVoice {
   private stream: MediaStream | null = null;
   private vad: MicVAD | null = null;
   private recorder: MediaRecorder | null = null;
-  private socket: WebSocket | null = null;
-  private keepAlive = 0;
+  private flux: FluxConnection | null = null;
   private ring: Blob[] = [];
   private utterance: Blob[] = [];
-  private sending = false;
-  private flux = false;
+  private sentChunks = 0;
+  private speechActive = false;
   private stopped = true;
+  private fluxOpening: Promise<void> | null = null;
   private fallbackAbort: AbortController | null = null;
 
   constructor(private callbacks: VoiceCallbacks) {}
-
-  get usingFlux() {
-    return this.flux;
-  }
 
   async start() {
     if (!this.stopped) return;
@@ -45,8 +43,6 @@ export class RealtimeVoice {
     }
 
     this.stopped = false;
-    this.callbacks.onStatus('Connecting');
-
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
@@ -56,13 +52,7 @@ export class RealtimeVoice {
       },
     });
 
-    await Promise.all([
-      this.startVad(this.stream),
-      this.connectFlux().catch(() => {
-        this.flux = false;
-      }),
-    ]);
-
+    await this.startVad(this.stream);
     this.startRecorder(this.stream);
     this.vad?.start();
     this.callbacks.onStatus('Ready');
@@ -72,13 +62,14 @@ export class RealtimeVoice {
     this.stopped = true;
     this.fallbackAbort?.abort();
     this.fallbackAbort = null;
-    window.clearInterval(this.keepAlive);
 
     try { this.recorder?.stop(); } catch { /* already stopped */ }
     this.recorder = null;
 
-    try { this.socket?.close(1000, 'presentation ended'); } catch { /* already closed */ }
-    this.socket = null;
+    try { this.flux?.sendCloseStream(); } catch { /* no active Flux turn */ }
+    try { this.flux?.close(); } catch { /* already closed */ }
+    this.flux = null;
+    this.fluxOpening = null;
 
     this.vad?.pause();
     this.vad = null;
@@ -88,70 +79,9 @@ export class RealtimeVoice {
 
     this.ring = [];
     this.utterance = [];
-    this.sending = false;
-    this.flux = false;
+    this.sentChunks = 0;
+    this.speechActive = false;
     this.callbacks.onStatus('Mic off');
-  }
-
-  private async connectFlux() {
-    const token = await deepgramToken();
-    if (this.stopped) return;
-
-    const url = new URL('wss://api.deepgram.com/v2/listen');
-    url.searchParams.set('model', 'flux-general-en');
-    url.searchParams.set('eager_eot_threshold', '0.6');
-    url.searchParams.set('eot_threshold', '0.8');
-    url.searchParams.set('eot_timeout_ms', '3500');
-
-    const socket = new WebSocket(url.toString(), ['bearer', token]);
-    this.socket = socket;
-
-    await new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(() => reject(new Error('Deepgram connection timed out')), 5000);
-      socket.onopen = () => {
-        window.clearTimeout(timeout);
-        this.flux = true;
-        resolve();
-      };
-      socket.onerror = () => {
-        window.clearTimeout(timeout);
-        reject(new Error('Deepgram Flux connection failed'));
-      };
-    });
-
-    socket.onmessage = event => {
-      if (typeof event.data !== 'string') return;
-      let message: TurnInfo;
-      try { message = JSON.parse(event.data) as TurnInfo; } catch { return; }
-      if (message.type !== 'TurnInfo') return;
-
-      const transcript = (message.transcript || '').trim();
-      if (message.event === 'StartOfTurn') {
-        this.callbacks.onSpeechStart();
-      } else if (message.event === 'EagerEndOfTurn' && transcript) {
-        this.callbacks.onEagerEnd(transcript);
-      } else if (message.event === 'TurnResumed') {
-        this.callbacks.onTurnResumed();
-      } else if (message.event === 'EndOfTurn' && transcript) {
-        this.sending = false;
-        this.utterance = [];
-        this.callbacks.onStatus('Ready');
-        this.callbacks.onFinal(transcript);
-      }
-    };
-
-    socket.onclose = () => {
-      if (!this.stopped) {
-        this.flux = false;
-        this.callbacks.onStatus('Ready');
-      }
-    };
-
-    this.keepAlive = window.setInterval(() => {
-      if (socket.readyState === WebSocket.OPEN && !this.sending) {
-        socket.send(JSON.stringify({ type: 'KeepAlive' }));
-      }
-    }, 8000);
   }
 
   private startRecorder(stream: MediaStream) {
@@ -165,12 +95,9 @@ export class RealtimeVoice {
       this.ring.push(event.data);
       if (this.ring.length > 5) this.ring.shift();
 
-      if (!this.sending) return;
+      if (!this.speechActive) return;
       this.utterance.push(event.data);
-
-      if (this.flux && this.socket?.readyState === WebSocket.OPEN) {
-        this.socket.send(event.data);
-      }
+      this.flushFluxChunks();
     };
 
     // Flux recommends ~80 ms chunks.
@@ -185,29 +112,30 @@ export class RealtimeVoice {
       positiveSpeechThreshold: 0.65,
       negativeSpeechThreshold: 0.42,
       minSpeechMs: 300,
-      redemptionMs: 550,
+      redemptionMs: 350,
       preSpeechPadMs: 160,
       getStream: async () => stream,
       pauseStream: async () => {},
       resumeStream: async () => stream,
       onSpeechStart: () => {
         if (this.stopped) return;
-        this.sending = true;
+        this.speechActive = true;
         this.utterance = [...this.ring];
-
-        if (this.flux && this.socket?.readyState === WebSocket.OPEN) {
-          for (const chunk of this.ring) this.socket.send(chunk);
-        }
-
+        this.sentChunks = 0;
         this.callbacks.onStatus('User speaking');
         this.callbacks.onSpeechStart();
+        this.fluxOpening = this.openFluxTurn().catch(() => {
+          this.flux = null;
+        });
       },
       onSpeechRealStart: () => {
         if (!this.stopped) this.callbacks.onSpeechConfirmed();
       },
       onVADMisfire: () => {
-        this.sending = false;
+        this.speechActive = false;
         this.utterance = [];
+        this.sentChunks = 0;
+        this.closeFluxTurn();
         if (!this.stopped) {
           this.callbacks.onStatus('Ready');
           this.callbacks.onSpeechMisfire();
@@ -215,22 +143,98 @@ export class RealtimeVoice {
       },
       onSpeechEnd: () => {
         if (this.stopped) return;
-
-        // With Flux, keep a short tail of silence so its turn model can finish.
-        if (this.flux) {
-          window.setTimeout(() => {
-            if (!this.stopped) this.sending = false;
-          }, 700);
-          return;
-        }
-
-        const chunks = [...this.utterance];
-        this.sending = false;
-        this.utterance = [];
-        if (!chunks.length) return;
-        void this.batchFallback(chunks);
+        this.speechActive = false;
+        void this.finishTurn();
       },
     });
+  }
+
+  private async openFluxTurn() {
+    const token = await deepgramToken();
+    if (this.stopped || !this.speechActive) return;
+
+    const client = new DeepgramClient({ accessToken: token });
+    const connection = await client.listen.v2.connect({
+      model: 'flux-general-en',
+      eager_eot_threshold: '0.6',
+      eot_threshold: '0.8',
+      eot_timeout_ms: '3500',
+      shouldReconnect: () => false,
+    });
+
+    connection.on('message', message => {
+      if (message.type !== 'TurnInfo') return;
+      const transcript = (message.transcript || '').trim();
+
+      if (message.event === 'StartOfTurn') {
+        this.callbacks.onStatus('Flux');
+      } else if (message.event === 'EagerEndOfTurn' && transcript) {
+        this.callbacks.onEagerEnd(transcript);
+      } else if (message.event === 'TurnResumed') {
+        this.callbacks.onTurnResumed();
+      } else if (message.event === 'EndOfTurn' && transcript) {
+        this.callbacks.onFinal(transcript);
+        this.closeFluxTurn();
+        if (!this.stopped) this.callbacks.onStatus('Ready');
+      }
+    });
+
+    connection.on('error', () => {
+      this.flux = null;
+    });
+
+    connection.connect();
+    await connection.waitForOpen();
+
+    if (this.stopped || !this.speechActive) {
+      connection.sendCloseStream();
+      connection.close();
+      return;
+    }
+
+    this.flux = connection;
+    this.callbacks.onStatus('Flux');
+    this.flushFluxChunks();
+  }
+
+  private flushFluxChunks() {
+    if (!this.flux) return;
+    while (this.sentChunks < this.utterance.length) {
+      this.flux.sendMedia(this.utterance[this.sentChunks]);
+      this.sentChunks += 1;
+    }
+  }
+
+  private async finishTurn() {
+    try {
+      await this.fluxOpening;
+    } catch {
+      // Fall through to the batch fallback.
+    }
+
+    if (this.flux) {
+      this.flushFluxChunks();
+      try {
+        this.flux.sendForceEndTurn();
+        return;
+      } catch {
+        this.closeFluxTurn();
+      }
+    }
+
+    const chunks = [...this.utterance];
+    this.utterance = [];
+    this.sentChunks = 0;
+    if (chunks.length) await this.batchFallback(chunks);
+  }
+
+  private closeFluxTurn() {
+    const connection = this.flux;
+    this.flux = null;
+    this.fluxOpening = null;
+    if (!connection) return;
+    try { connection.sendCloseStream(); } catch { /* already closing */ }
+    try { connection.close(); } catch { /* already closed */ }
   }
 
   private async batchFallback(chunks: Blob[]) {
