@@ -15,6 +15,8 @@ export type CachedDeck = {
   fillers: {
     goodQuestion: ArrayBuffer;
     letMeShowYou: ArrayBuffer;
+    anyQuestions: ArrayBuffer;
+    finalQuestions: ArrayBuffer;
   };
 };
 
