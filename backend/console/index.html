@@ -26,6 +26,10 @@ const providers={};shown.forEach(e=>{if(e.provider){const k=e.provider+'/'+(e.mo
 $('usage').innerHTML=`<div class="metricrow"><span>Input tokens</span><strong>${inTokens.toLocaleString()}</strong></div><div class="metricrow"><span>Output tokens</span><strong>${outTokens.toLocaleString()}</strong></div>`+quotaRows+Object.entries(providers).map(([k,v])=>`<div class="metricrow"><span>${escapeHtml(k)}</span><span>${v.toLocaleString()} tokens</span></div>`).join('');
 $('terminal').innerHTML=shown.length?shown.map(e=>`<details class="line"><summary><span class="muted">${escapeHtml(new Date(e.ts).toLocaleTimeString())}</span> <span class="${escapeHtml(e.kind)}">${escapeHtml(e.kind.toUpperCase())}</span> ${escapeHtml(e.route)} · ${escapeHtml(e.session_id?.slice(0,8))} ${e.latency_ms!=null?'· '+e.latency_ms+'ms':''}</summary><pre>${escapeHtml(JSON.stringify(e,null,2))}</pre></details>`).join(''):'<div class="line muted">No events in this window.</div>';
 }
-async function poll(){if(paused)return;try{const r=await fetch('/api/events?limit=200',{headers:{'X-Console-Token':$('token').value}});if(!r.ok)throw Error(r.status===401?'Provide the admin token configured in backend.':'Event API unavailable.');events=(await r.json()).events||[];$('alert').textContent='';render()}catch(e){$('alert').textContent=e.message}}
+async function poll(){if(paused)return;try{const r=await fetch('/api/events?limit=200',{headers:{'X-Console-Token':$('token').value}});
+if(!r.ok){const result=await r.json().catch(()=>({}));
+const message=r.status===401?'Admin token missing or invalid. Enter the CONSOLE_ADMIN_TOKEN from Vercel and press Refresh.':r.status===503?'Monitoring is not configured. Set CONSOLE_ADMIN_TOKEN in the backend Vercel project and redeploy.':(result.detail||`Event API returned HTTP ${r.status}`);
+throw Error(message)}events=(await r.json()).events||[];$('alert').textContent='';render()}catch(e){$('alert').textContent=e.message}}
+$('token').addEventListener('change',()=>void poll());
 void poll();setInterval(()=>void poll(),4000);
 </script></body></html>
