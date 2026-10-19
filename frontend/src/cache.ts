@@ -1,11 +1,7 @@
-export type CachedSentence = {
-  text: string;
-  audio: ArrayBuffer;
-};
-
 export type CachedSlide = {
   text: string;
-  sentences: CachedSentence[];
+  sentences: string[];
+  audio: ArrayBuffer;
 };
 
 export type CachedDeck = {
@@ -22,7 +18,9 @@ export type CachedDeck = {
 
 const DB_NAME = 'voice-presenter';
 const STORE = 'prepared-decks';
-export const CACHE_VERSION = '2026-10-20-v1';
+
+// v2 stores one audio file per slide instead of one request per sentence.
+export const CACHE_VERSION = '2026-10-20-v2';
 
 function openDb() {
   return new Promise<IDBDatabase>((resolve, reject) => {
@@ -67,20 +65,29 @@ export async function savePreparedDeck(deck: CachedDeck) {
 }
 
 export function splitSentences(text: string): string[] {
-  const raw = text.match(/[^.!?]+(?:[.!?]+|$)/g) || [text];
-  const sentences: string[] = [];
+  return (text.match(/[^.!?]+(?:[.!?]+|$)/g) || [text])
+    .map(sentence => sentence.trim())
+    .filter(Boolean);
+}
 
-  for (const item of raw) {
-    let sentence = item.trim();
-    while (sentence.length > 900) {
-      let cut = sentence.lastIndexOf(',', 880);
-      if (cut < 350) cut = sentence.lastIndexOf(' ', 880);
-      if (cut < 200) cut = 880;
-      sentences.push(sentence.slice(0, cut + 1).trim());
-      sentence = sentence.slice(cut + 1).trim();
-    }
-    if (sentence) sentences.push(sentence);
+export function sentenceBoundary(
+  sentences: string[],
+  duration: number,
+  currentOffset: number,
+) {
+  if (!sentences.length || duration <= 0 || currentOffset <= 0) return 0;
+
+  const weights = sentences.map(sentence => Math.max(1, sentence.length));
+  const total = weights.reduce((sum, value) => sum + value, 0);
+  let elapsed = 0;
+  let boundary = 0;
+
+  for (const weight of weights) {
+    const next = elapsed + duration * (weight / total);
+    if (next > currentOffset) return Math.max(0, boundary);
+    boundary = next;
+    elapsed = next;
   }
 
-  return sentences;
+  return Math.max(0, Math.min(boundary, duration));
 }
