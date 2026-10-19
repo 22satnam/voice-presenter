@@ -1,5 +1,6 @@
 """Small FastAPI backend for the three bundled presentations."""
 
+import base64
 import json
 import logging
 import os
@@ -8,7 +9,7 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -26,6 +27,8 @@ logger = logging.getLogger('presenter')
 DECK_DIR = Path(__file__).parent / 'decks'
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.5-flash-lite')
 GROQ_MODEL = os.getenv('GROQ_ANSWER_MODEL', 'openai/gpt-oss-20b')
+TTS_MODEL = os.getenv('GEMINI_TTS_MODEL', 'gemini-3.8-flash-tts')
+TTS_VOICE = os.getenv('GEMINI_TTS_VOICE', 'Sulafat')
 
 
 class NarrateInput(BaseModel):
@@ -33,14 +36,12 @@ class NarrateInput(BaseModel):
     slide_index: int = Field(ge=0)
 
 
-class AskInput(BaseModel):
-    deck_id: str
-    question: str = Field(min_length=1, max_length=1500)
-    current_slide: int = Field(ge=0)
+class ChatMessage(BaseModel):
+    role: str = Field(pattern='^(user|assistant)
 
 
 class SpeechInput(BaseModel):
-    text: str = Field(min_length=1, max_length=190)
+    text: str = Field(min_length=1, max_length=1800)
 
 
 def load_deck(deck_id: str):
@@ -123,7 +124,8 @@ async def generate(prompt: str, *, json_result: bool = False, max_tokens: int = 
 @app.get('/api/health')
 def health():
     return {'ok': True, 'gemini_configured': bool(os.getenv('GEMINI_API_KEY')),
-            'groq_configured': bool(os.getenv('GROQ_API_KEY')), 'gemini_model': GEMINI_MODEL}
+            'groq_configured': bool(os.getenv('GROQ_API_KEY')), 'gemini_model': GEMINI_MODEL,
+            'tts_model': TTS_MODEL, 'stt_configured': bool(os.getenv('GROQ_API_KEY'))}
 
 
 @app.get('/api/decks')
@@ -162,7 +164,7 @@ async def narrate(req: NarrateInput):
 async def ask(req: AskInput):
     deck = load_deck(req.deck_id)
     get_slide(deck, req.current_slide)
-    slides = [{'number': i+1, 'title': s['title'], 'content': s['text'][:1600]}
+    slides = [{'number': i+1, 'title': s['title'], 'content': s['text'][:950]}
               for i, s in enumerate(deck['slides'])]
     prompt = (
         'You are answering a question during a presentation. Find the slide most relevant '
@@ -170,8 +172,12 @@ async def ask(req: AskInput):
         'Return ONLY a JSON object with "slide_number" (1-based integer) and "answer" '
         '(two to five spoken sentences). Do not fabricate facts, and make it clear when '
         'the uploaded presentation does not contain an answer. For questions unrelated '
-        'to the slides, keep the current slide and give a brief general answer only if confident.\n'
-        f'Current slide: {req.current_slide + 1}\nQuestion: {req.question}\n'
+        'to the slides, keep the current slide and give a brief general answer only if confident. '
+        'For follow-up questions, interpret references like "that", "it", or "the last point" '
+        'using the recent conversation, but choose the slide based on the actual deck.\n'
+        f'Current slide: {req.current_slide + 1}\n'
+        f'Recent conversation: {json.dumps([m.model_dump() for m in req.history], ensure_ascii=False)}\n'
+        f'Question: {req.question}\n'
         f'Presentation: {json.dumps(slides, ensure_ascii=False)}'
     )
     text, provider = await generate(prompt, json_result=True, max_tokens=450)
@@ -186,22 +192,70 @@ async def ask(req: AskInput):
     return {'slide_index': index, 'slide_number': index+1, 'answer': answer, 'provider': provider}
 
 
-@app.post('/api/tts')
-async def tts(req: SpeechInput):
+@app.post('/api/stt')
+async def transcribe(file: UploadFile = File(...)):
+    """Browser records locally; Groq Whisper transcribes the short utterance."""
     key = os.getenv('GROQ_API_KEY')
     if not key:
-        raise HTTPException(503, 'Voice provider is not configured')
+        raise HTTPException(503, 'Speech input is not configured')
+    audio = await file.read(5 * 1024 * 1024 + 1)
+    if len(audio) > 5 * 1024 * 1024:
+        raise HTTPException(413, 'Audio recording is too long')
+    if len(audio) < 1000:
+        raise HTTPException(422, 'Audio recording was too short')
+    filename = file.filename or 'question.webm'
+    if not filename.lower().endswith(('.webm', '.wav', '.mp4', '.m4a', '.ogg')):
+        raise HTTPException(415, 'Unsupported audio type')
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post('https://api.groq.com/openai/v1/audio/speech',
+            response = await client.post(
+                'https://api.groq.com/openai/v1/audio/transcriptions',
                 headers={'Authorization': f'Bearer {key}'},
-                json={'model': 'canopylabs/orpheus-v1-english', 'voice': 'troy',
-                      'input': req.text, 'response_format': 'wav'})
+                data={'model': 'whisper-large-v3-turbo', 'response_format': 'json'},
+                files={'file': (filename, audio, file.content_type or 'audio/webm')},
+            )
             response.raise_for_status()
-        if not response.content:
-            raise ValueError('No audio returned')
-        return Response(content=response.content, media_type='audio/wav')
+        return {'text': response.json().get('text', '').strip()}
     except (httpx.HTTPError, ValueError) as exc:
         code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
-        logger.warning('Groq TTS unavailable (%s)', code)
-        raise HTTPException(502, 'Voice provider is unavailable')
+        logger.warning('Transcription failed (%s)', code)
+        raise HTTPException(502, 'Could not transcribe audio; type your question instead') from exc
+
+
+@app.post('/api/tts')
+async def tts(req: SpeechInput):
+    """Gemini handles voice generation; lite is the only automatic fallback."""
+    key = os.getenv('GEMINI_API_KEY')
+    if not key:
+        raise HTTPException(503, 'Gemini voice is not configured')
+    models = list(dict.fromkeys([TTS_MODEL, 'gemini-3.8-flash-lite-tts']))
+    body = {
+        'contents': [{'role': 'user', 'parts': [{
+            'text': req.text,
+            'speech_metadata': {'style': 'warm, conversational, measured and engaging'},
+        }]}],
+        'generationConfig': {
+            'responseModalities': ['AUDIO'],
+            'speechConfig': {'voiceConfig': {'voice': TTS_VOICE}},
+        },
+    }
+    for model in models:
+        try:
+            async with httpx.AsyncClient(timeout=50) as client:
+                response = await client.post(
+                    f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent',
+                    headers={'x-goog-api-key': key},
+                    json=body,
+                )
+                response.raise_for_status()
+            parts = response.json()['candidates'][0]['content']['parts']
+            encoded = next(part['inlineData']['data'] for part in parts if 'inlineData' in part)
+            audio = base64.b64decode(encoded)
+            if audio[:4] != b'RIFF':
+                raise ValueError('Gemini did not return WAV audio')
+            return Response(content=audio, media_type='audio/wav',
+                            headers={'X-Voice-Provider': model, 'Cache-Control': 'no-store'})
+        except (httpx.HTTPError, ValueError, KeyError, IndexError, StopIteration) as exc:
+            code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+            logger.warning('Gemini voice model %s unavailable (%s)', model, code)
+    raise HTTPException(502, 'Gemini voice unavailable. Please retry shortly')
