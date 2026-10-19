@@ -24,7 +24,7 @@ app.add_middleware(
 )
 logger = logging.getLogger('presenter')
 DECK_DIR = Path(__file__).parent / 'decks'
-GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash-lite')
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.5-flash-lite')
 GROQ_MODEL = os.getenv('GROQ_ANSWER_MODEL', 'openai/gpt-oss-20b')
 
 
@@ -69,29 +69,34 @@ async def generate(prompt: str, *, json_result: bool = False, max_tokens: int = 
     """Gemini is preferred. Groq is only used if Gemini fails."""
     gemini_key = os.getenv('GEMINI_API_KEY')
     if gemini_key:
-        try:
-            body = {
-                'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
-                'generationConfig': {'temperature': 0.4, 'maxOutputTokens': max_tokens},
-            }
-            if json_result:
-                body['generationConfig']['responseMimeType'] = 'application/json'
-            async with httpx.AsyncClient(timeout=35) as client:
-                response = await client.post(
-                    f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent',
-                    headers={'x-goog-api-key': gemini_key}, json=body,
-                )
-                response.raise_for_status()
-            output = response.json()
-            text = ''.join(p.get('text', '') for p in output['candidates'][0]['content']['parts'])
-            if not text.strip():
-                raise ValueError('Empty Gemini answer')
-            if json_result:
-                parse_json(text)
-            return text, 'gemini'
-        except (httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
-            code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
-            logger.warning('Gemini unavailable (%s); trying Groq', code)
+        body = {
+            'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
+            'generationConfig': {'temperature': 0.4, 'maxOutputTokens': max_tokens},
+        }
+        if json_result:
+            body['generationConfig']['responseMimeType'] = 'application/json'
+        # Try another current Flash model if the configured one isn't available to this key.
+        models = list(dict.fromkeys([GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-3.1-flash-lite']))
+        for model in models:
+            try:
+                async with httpx.AsyncClient(timeout=35) as client:
+                    response = await client.post(
+                        f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent',
+                        headers={'x-goog-api-key': gemini_key}, json=body,
+                    )
+                    response.raise_for_status()
+                output = response.json()
+                result = ''.join(p.get('text', '') for p in output['candidates'][0]['content']['parts'])
+                if not result.strip():
+                    raise ValueError('Empty Gemini answer')
+                if json_result:
+                    parse_json(result)
+                return result, 'gemini'
+            except (httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
+                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                logger.warning('Gemini model %s failed (%s)', model, status or type(exc).__name__)
+                if status != 404:
+                    break
 
     groq_key = os.getenv('GROQ_API_KEY')
     if groq_key:
@@ -118,7 +123,7 @@ async def generate(prompt: str, *, json_result: bool = False, max_tokens: int = 
 @app.get('/api/health')
 def health():
     return {'ok': True, 'gemini_configured': bool(os.getenv('GEMINI_API_KEY')),
-            'groq_configured': bool(os.getenv('GROQ_API_KEY'))}
+            'groq_configured': bool(os.getenv('GROQ_API_KEY')), 'gemini_model': GEMINI_MODEL}
 
 
 @app.get('/api/decks')
@@ -191,7 +196,7 @@ async def tts(req: SpeechInput):
             response = await client.post('https://api.groq.com/openai/v1/audio/speech',
                 headers={'Authorization': f'Bearer {key}'},
                 json={'model': 'canopylabs/orpheus-v1-english', 'voice': 'troy',
-                      'input': req.text, 'response_format': 'wav', 'sample_rate': 48000})
+                      'input': req.text, 'response_format': 'wav'})
             response.raise_for_status()
         if not response.content:
             raise ValueError('No audio returned')
