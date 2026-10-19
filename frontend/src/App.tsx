@@ -16,7 +16,7 @@ export default function App() {
   const [error, setError] = useState('');
   const [voice, setVoice] = useState('');
   const [micStatus, setMicStatus] = useState('Mic off');
-  const [messagesRef] = useState(() => ({ current: [] as Message[] }));
+  const messagesRef = useRef<Message[]>([]);
   const abort = useRef<AbortController | null>(null);
   const speaker = useRef(new Speaker());
   const listener = useRef<Listener | null>(null);
