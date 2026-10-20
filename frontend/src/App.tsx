@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type Deck, type DeckItem } from "./api";
-import { GeminiLivePresenter } from "./live";
+import { VoicePresenterSession } from "./live";
 
 type Message = {
   role: "You" | "Presenter";
@@ -20,7 +20,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [liveTranscript, setLiveTranscript] = useState("");
 
-  const live = useRef<GeminiLivePresenter | null>(null);
+  const live = useRef<VoicePresenterSession | null>(null);
   const presentationSlide = useRef(0);
   const questionActive = useRef(false);
   const resumeSlide = useRef<number | null>(null);
@@ -100,7 +100,7 @@ export default function App() {
     if (!deck || runningRef.current) return;
 
     setError("");
-    setLoading("Starting Gemini Live…");
+    setLoading("Starting voice session…");
     setStatus("Connecting…");
     setRunning(true);
     runningRef.current = true;
@@ -108,7 +108,7 @@ export default function App() {
     resumeSlide.current = null;
     clearAdvanceTimer();
 
-    const session = new GeminiLivePresenter(deck, {
+    const session = new VoicePresenterSession(deck, {
       onStatus: setStatus,
       onSlide: index => setSlide(index),
       onUserActivity: () => {
@@ -177,7 +177,7 @@ export default function App() {
       setLoading("");
       sendSlide(presentationSlide.current);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not start Gemini Live");
+      setError(err instanceof Error ? err.message : "Could not start the voice session");
       stop();
     }
   }
@@ -204,7 +204,7 @@ export default function App() {
     if (resumeSlide.current === null) resumeSlide.current = presentationSlide.current;
     addMessage({ role: "You", text });
     setQuestion("");
-    setStatus("Asking Gemini…");
+    setStatus("Answering…");
     live.current.sendQuestion(text);
   }
 
@@ -219,7 +219,7 @@ export default function App() {
     return (
       <main className="home">
         <h1>Voice Presenter</h1>
-        <p>Choose a presentation and start a live, interruptible Gemini voice session.</p>
+        <p>Choose a presentation and start an interactive voice presentation.</p>
 
         {error && <p role="alert" className="error">{error}</p>}
 
