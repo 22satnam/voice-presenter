@@ -76,7 +76,7 @@ async def live_token():
     """Mint a one-use short-lived token for a browser Gemini Live session."""
     key = os.getenv("GEMINI_API_KEY")
     if not key:
-        raise HTTPException(503, "Gemini is not configured")
+        raise HTTPException(503, "Voice service is not configured")
 
     now = datetime.now(timezone.utc)
     body = {
@@ -96,4 +96,4 @@ async def live_token():
         token = response.json()["name"]
         return {"token": token, "model": LIVE_MODEL}
     except (httpx.HTTPError, KeyError, ValueError) as exc:
-        raise HTTPException(502, "Could not create Gemini Live session") from exc
+        raise HTTPException(502, "Could not create voice session") from exc
