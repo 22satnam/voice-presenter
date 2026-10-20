@@ -40,7 +40,7 @@ export async function createLiveToken(signal?: AbortSignal) {
   });
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
-    throw new Error(error.detail || "Could not start Gemini Live");
+    throw new Error(error.detail || "Could not start the voice session");
   }
   return response.json() as Promise<{ token: string; model: string }>;
 }
