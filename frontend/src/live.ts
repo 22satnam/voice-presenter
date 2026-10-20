@@ -59,7 +59,7 @@ function mergeTranscript(current: string, next: string) {
   return (current + " " + text).trim();
 }
 
-export class GeminiLivePresenter {
+export class VoicePresenterSession {
   private socket: WebSocket | null = null;
   private micStream: MediaStream | null = null;
   private inputContext: AudioContext | null = null;
@@ -73,6 +73,8 @@ export class GeminiLivePresenter {
   private modelTranscript = "";
   private turnInterrupted = false;
   private readyResolve: (() => void) | null = null;
+  private readyReject: ((error: Error) => void) | null = null;
+  private closing = false;
 
   constructor(
     private deck: Deck,
@@ -85,7 +87,14 @@ export class GeminiLivePresenter {
   }
 
   async connect() {
-    this.callbacks.onStatus("Connecting to Gemini Live…");
+    this.closing = false;
+
+    // Request microphone access first, directly from the Present click path.
+    // If this fails we never create a remote voice session.
+    this.callbacks.onStatus("Requesting microphone…");
+    await this.startMicrophone();
+
+    this.callbacks.onStatus("Connecting…");
     const { token, model } = await createLiveToken();
 
     const url =
@@ -97,11 +106,21 @@ export class GeminiLivePresenter {
     await new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(url);
       this.socket = socket;
-      const timeout = window.setTimeout(() => reject(new Error("Gemini Live connection timed out")), 10000);
+      const timeout = window.setTimeout(() => {
+        reject(new Error("Voice session connection timed out"));
+      }, 10000);
 
       this.readyResolve = () => {
         window.clearTimeout(timeout);
+        this.readyResolve = null;
+        this.readyReject = null;
         resolve();
+      };
+      this.readyReject = error => {
+        window.clearTimeout(timeout);
+        this.readyResolve = null;
+        this.readyReject = null;
+        reject(error);
       };
 
       socket.onopen = () => {
@@ -153,21 +172,36 @@ export class GeminiLivePresenter {
         }));
       };
 
-      socket.onmessage = event => this.handleMessage(JSON.parse(event.data));
-      socket.onerror = () => {
-        window.clearTimeout(timeout);
-        reject(new Error("Gemini Live WebSocket failed"));
-      };
-      socket.onclose = event => {
-        if (event.code !== 1000) {
-          this.callbacks.onError(event.reason || "Gemini Live session closed");
+      socket.onmessage = event => {
+        try {
+          this.handleMessage(JSON.parse(event.data));
+        } catch {
+          this.callbacks.onError("Received an invalid realtime response");
         }
-        this.callbacks.onStatus("Disconnected");
+      };
+
+      socket.onerror = () => {
+        this.readyReject?.(new Error("Could not open the voice connection"));
+      };
+
+      socket.onclose = event => {
+        window.clearTimeout(timeout);
+        const reason = event.reason?.trim();
+        this.readyReject?.(
+          new Error(reason || "Voice session closed during startup"),
+        );
+
+        if (this.closing) return;
+
+        const message = reason
+          ? "Voice connection ended: " + reason
+          : "Voice connection ended unexpectedly (code " + event.code + ").";
+        this.callbacks.onError(message);
+        this.callbacks.onStatus("Connection lost");
       };
     });
 
-    await this.startMicrophone();
-    this.callbacks.onStatus("Live · listening");
+    this.callbacks.onStatus("Listening");
   }
 
   sendPresentationSlide(slideIndex: number, resume = false) {
@@ -187,6 +221,8 @@ export class GeminiLivePresenter {
   }
 
   close() {
+    this.closing = true;
+
     try {
       if (this.socket?.readyState === WebSocket.OPEN) {
         this.socket.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
@@ -205,10 +241,11 @@ export class GeminiLivePresenter {
     this.micStream = null;
     this.inputContext = null;
     this.outputContext = null;
+    this.nextPlaybackTime = 0;
 
-    try { this.socket?.close(1000, "presentation ended"); } catch { }
+    const socket = this.socket;
     this.socket = null;
-    this.callbacks.onStatus("Disconnected");
+    try { socket?.close(1000, "presentation ended"); } catch { }
   }
 
   private sendClientText(text: string) {
@@ -249,19 +286,41 @@ export class GeminiLivePresenter {
   }
 
   private async startMicrophone() {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: false,
-      },
-    });
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error("Microphone access is not supported in this browser");
+    }
+
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false,
+        },
+      });
+    } catch (error) {
+      const name = error instanceof DOMException ? error.name : "";
+      if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+        throw new Error("Microphone permission is required. Allow microphone access and try again.");
+      }
+      if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+        throw new Error("No microphone was found on this device.");
+      }
+      throw new Error("Could not start the microphone. Check browser microphone access and try again.");
+    }
 
     this.micStream = stream;
     const context = new AudioContext();
     this.inputContext = context;
-    await context.resume();
+
+    try {
+      await context.resume();
+    } catch {
+      stream.getTracks().forEach(track => track.stop());
+      throw new Error("The browser could not start microphone audio.");
+    }
 
     const source = context.createMediaStreamSource(stream);
     const processor = context.createScriptProcessor(2048, 1, 1);
