@@ -172,12 +172,10 @@ export class VoicePresenterSession {
         }));
       };
 
+      socket.binaryType = "arraybuffer";
+
       socket.onmessage = event => {
-        try {
-          this.handleMessage(JSON.parse(event.data));
-        } catch {
-          this.callbacks.onError("Received an invalid realtime response");
-        }
+        void this.parseSocketMessage(event.data);
       };
 
       socket.onerror = () => {
@@ -347,6 +345,25 @@ export class VoicePresenterSession {
 
     this.processor = processor;
     this.sink = sink;
+  }
+
+  private async parseSocketMessage(data: string | Blob | ArrayBuffer) {
+    try {
+      let text: string;
+
+      if (typeof data === "string") {
+        text = data;
+      } else if (data instanceof Blob) {
+        text = await data.text();
+      } else {
+        text = new TextDecoder().decode(data);
+      }
+
+      this.handleMessage(JSON.parse(text));
+    } catch (error) {
+      console.error("Could not parse realtime message", error);
+      this.callbacks.onError("Received an invalid realtime response");
+    }
   }
 
   private handleMessage(message: any) {
